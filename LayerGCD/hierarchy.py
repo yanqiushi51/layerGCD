@@ -40,7 +40,7 @@ class HierarchicalClusterTree:
         total_classes = n_labeled + n_unlabeled
         self.n_clusters_per_level = {}
         for i, layer_idx in enumerate(reversed(extract_layers)):
-            n_cls = max(total_classes // (2 ** i), min_classes)
+            n_cls = min(total_classes, max(total_classes // (2 ** i), min_classes))
             self.n_clusters_per_level[layer_idx] = n_cls
         
         # Storage for prototypes and pseudo-labels
@@ -221,7 +221,8 @@ class HierarchicalClusterTree:
             dtype=torch.long,
         )
 
-    def get_confusion_weights(self, features_dict, sample_indices, device='cuda', n_views=2):
+    def get_confusion_weights(self, features_dict, sample_indices, device='cuda', n_views=2,
+                              mode='multi'):
         """
         Compute semantic-aware confusion weights using hierarchy.
         
@@ -242,8 +243,12 @@ class HierarchicalClusterTree:
         confusion = torch.zeros(B, B, device=device)
         positions = self._resolve_positions(sample_indices)
 
-        num_levels = len(self.extract_layers)
-        for i, layer_idx in enumerate(self.extract_layers):
+        active_layers = [self.extract_layers[0]] if mode == 'coarse' else self.extract_layers
+        if mode not in ('multi', 'coarse'):
+            raise ValueError(f"Unknown relation relaxation mode: {mode}")
+
+        num_levels = len(active_layers)
+        for i, layer_idx in enumerate(active_layers):
             pseudo = self.pseudo_labels[layer_idx][positions].to(device)
             # Same cluster → 1, different → 0
             same_cluster = (pseudo.unsqueeze(0) == pseudo.unsqueeze(1)).float()
@@ -252,7 +257,7 @@ class HierarchicalClusterTree:
             confusion += weight * same_cluster
         
         # Normalize to [0, 1]
-        confusion = confusion / confusion.max()
+        confusion = confusion / confusion.max().clamp_min(1e-12)
         
         # Expand for multi-view batches: [B, B] → [n_views * B, n_views * B]
         confusion = confusion.repeat(n_views, n_views)

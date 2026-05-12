@@ -133,7 +133,9 @@ class PromptGuidedDINO(nn.Module):
     that navigate the layers. P_coarse extracts macro features and injects a prior 
     into P_fine.
     """
-    def __init__(self, num_classes, extract_layers=(7, 11), num_coarse_classes=None, num_prompt_tokens=4):
+    def __init__(self, num_classes, extract_layers=(7, 11), num_coarse_classes=None,
+                 num_prompt_tokens=4, disable_bridge=False, fine_prompt_only=False,
+                 no_prompts=False):
         super().__init__()
         from network import build_multilayer_dino
 
@@ -153,12 +155,23 @@ class PromptGuidedDINO(nn.Module):
         self.dino = self.dino_feature_extractor.backbone
         
         self.num_prompt_tokens = num_prompt_tokens
+        self.disable_bridge = disable_bridge
+        self.fine_prompt_only = fine_prompt_only
+        self.no_prompts = no_prompts
             
         # Multi-token learnable prompts for stronger representational capacity
-        self.P_coarse = nn.Parameter(torch.randn(1, num_prompt_tokens, 768))
-        self.P_fine = nn.Parameter(torch.randn(1, num_prompt_tokens, 768))
-        nn.init.normal_(self.P_coarse, std=0.02)
-        nn.init.normal_(self.P_fine, std=0.02)
+        if no_prompts:
+            self.register_parameter('P_coarse', None)
+            self.register_parameter('P_fine', None)
+        elif not fine_prompt_only:
+            self.P_coarse = nn.Parameter(torch.randn(1, num_prompt_tokens, 768))
+            nn.init.normal_(self.P_coarse, std=0.02)
+            self.P_fine = nn.Parameter(torch.randn(1, num_prompt_tokens, 768))
+            nn.init.normal_(self.P_fine, std=0.02)
+        else:
+            self.register_parameter('P_coarse', None)
+            self.P_fine = nn.Parameter(torch.randn(1, num_prompt_tokens, 768))
+            nn.init.normal_(self.P_fine, std=0.02)
         
         self.coarse_layer_idx = extract_layers[0]
         self.fine_layer_idx = extract_layers[-1]
@@ -170,9 +183,11 @@ class PromptGuidedDINO(nn.Module):
         self.num_fine_classes = num_classes
 
         # Two distinct heads for tracking macro and micro concepts
-        self.coarse_head = DINOHead(in_dim=768, out_dim=num_coarse_classes, nlayers=3)
-        # Fix 1: CLS (768) + P_fine (768) = 1536
-        self.fine_head = DINOHead(in_dim=768 * 2, out_dim=num_classes, nlayers=3)
+        self.coarse_head = None if (fine_prompt_only or no_prompts) else DINOHead(
+            in_dim=768, out_dim=num_coarse_classes, nlayers=3
+        )
+        fine_head_dim = 768 if no_prompts else 768 * 2
+        self.fine_head = DINOHead(in_dim=fine_head_dim, out_dim=num_classes, nlayers=3)
         
         # Bridge MLP to pass structural priors from P_coarse to P_fine
         self.bridge_mlp = nn.Sequential(
@@ -190,17 +205,32 @@ class PromptGuidedDINO(nn.Module):
         
         # Convert images to patch tokens + CLS token
         x = self.dino.prepare_tokens(x)
+
+        if self.no_prompts:
+            for blk in self.dino.blocks:
+                x = blk(x)
+            x = self.dino.norm(x)
+            fine_feat = x[:, 0, :]
+            fine_proj, fine_logits = self.fine_head(fine_feat)
+            return None, fine_logits, None, fine_feat, None, fine_proj
         
         # Split tokens to insert Prompts
         cls_token = x[:, :1, :]
         patch_tokens = x[:, 1:, :]
         
-        p_c = self.P_coarse.expand(B, -1, -1)
         p_f = self.P_fine.expand(B, -1, -1)
         
-        # Sequence: [CLS, P_c_1..P_c_N, P_f_1..P_f_N, Patch_1..Patch_196]
-        # Indices:   0    1..N_p          N_p+1..2*N_p  2*N_p+1..
-        x = torch.cat([cls_token, p_c, p_f, patch_tokens], dim=1)
+        if self.fine_prompt_only:
+            # Sequence: [CLS, P_f_1..P_f_N, Patch_1..Patch_196]
+            x = torch.cat([cls_token, p_f, patch_tokens], dim=1)
+            fine_start = 1
+            fine_end = 1 + N_p
+        else:
+            p_c = self.P_coarse.expand(B, -1, -1)
+            # Sequence: [CLS, P_c_1..P_c_N, P_f_1..P_f_N, Patch_1..Patch_196]
+            x = torch.cat([cls_token, p_c, p_f, patch_tokens], dim=1)
+            fine_start = 1 + N_p
+            fine_end = 1 + 2 * N_p
         
         coarse_feat = None
         coarse_logits = None
@@ -212,7 +242,7 @@ class PromptGuidedDINO(nn.Module):
         for i, blk in enumerate(self.dino.blocks):
             x = blk(x)
 
-            if i == self.coarse_layer_idx:
+            if (not self.fine_prompt_only) and i == self.coarse_layer_idx:
                 # Extract P_coarse tokens after the coarse checkpoint block.
                 # Average-pool the N_p coarse tokens into a single representation.
                 coarse_raw = x[:, 1:1+N_p, :].mean(dim=1)
@@ -222,20 +252,17 @@ class PromptGuidedDINO(nn.Module):
                 coarse_proj, coarse_logits = self.coarse_head(coarse_feat)
 
                 # Information Injection: MLP(P_coarse) -> each P_fine token
-                prior_msg = self.bridge_mlp(coarse_feat)  # [B, 768]
+                prior_msg = None if self.disable_bridge else self.bridge_mlp(coarse_feat)  # [B, 768]
 
                 # Avoid inplace operation which breaks PyTorch autograd
-                fine_start = 1 + N_p
-                fine_end = 1 + 2 * N_p
-                x_p_fine_new = x[:, fine_start:fine_end, :] + prior_msg.unsqueeze(1)
-                x = torch.cat([x[:, :fine_start, :], x_p_fine_new, x[:, fine_end:, :]], dim=1)
+                if prior_msg is not None:
+                    x_p_fine_new = x[:, fine_start:fine_end, :] + prior_msg.unsqueeze(1)
+                    x = torch.cat([x[:, :fine_start, :], x_p_fine_new, x[:, fine_end:, :]], dim=1)
             
         # Final layer normalization
         x = self.dino.norm(x)
         
         # Fix 1: concat DINO [CLS] with P_fine for maximum power
-        fine_start = 1 + N_p
-        fine_end = 1 + 2 * N_p
         cls_feat = x[:, 0, :]
         fine_prompt_feat = x[:, fine_start:fine_end, :].mean(dim=1)
         fine_feat = torch.cat([cls_feat, fine_prompt_feat], dim=-1)  # [B, 1536]
@@ -351,6 +378,7 @@ class DistillLoss(nn.Module):
         super().__init__()
         self.student_temp = student_temp
         self.ncrops = ncrops
+        warmup_teacher_temp_epochs = min(warmup_teacher_temp_epochs, nepochs)
         self.teacher_temp_schedule = np.concatenate((
             np.linspace(warmup_teacher_temp, teacher_temp, warmup_teacher_temp_epochs),
             np.ones(nepochs - warmup_teacher_temp_epochs) * teacher_temp
@@ -360,7 +388,7 @@ class DistillLoss(nn.Module):
         student_out = student_output / self.student_temp
         student_out = student_out.chunk(self.ncrops)
 
-        temp = self.teacher_temp_schedule[epoch]
+        temp = self.teacher_temp_schedule[min(epoch, len(self.teacher_temp_schedule) - 1)]
         teacher_out = F.softmax(teacher_output / temp, dim=-1)
         teacher_out = teacher_out.detach().chunk(self.ncrops)
 

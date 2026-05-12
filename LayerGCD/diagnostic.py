@@ -53,6 +53,8 @@ def extract_all_features(model, dataloader, layers, device='cuda'):
 def run_diagnostics():
     parser = argparse.ArgumentParser()
     parser.add_argument('--dataset_name', type=str, default='cub')
+    parser.add_argument('--split_type', type=str, default='random', choices=['random', 'confusable'])
+    parser.add_argument('--class_split_seed', type=int, default=0)
     parser.add_argument('--extract_layers', nargs='+', type=int, default=[7, 9, 11])
     parser.add_argument('--batch_size', type=int, default=128)
     parser.add_argument('--num_workers', type=int, default=8)
