@@ -65,7 +65,7 @@ def get_num_clusters_per_level(extract_layers, total_classes, min_classes=8):
     return n_clusters_per_level
 
 
-def train(model, train_loader, eval_loader_unlabelled, extract_loader, args):
+def train(model, train_loader, eval_loader_unlabelled, eval_loader_test, extract_loader, args):
     device = next(model.parameters()).device
     params_groups = get_params_groups(
         model,
@@ -100,6 +100,9 @@ def train(model, train_loader, eval_loader_unlabelled, extract_loader, args):
     else:
         args.logger.info("Hierarchy disabled: skipping coarse pseudo-targets and relation relaxation.")
 
+    best_all_acc = -1.0
+    best_old_acc = -1.0
+
     for epoch in range(args.epochs):
         loss_record = AverageMeter()
 
@@ -111,6 +114,7 @@ def train(model, train_loader, eval_loader_unlabelled, extract_loader, args):
             lambda_fine = min(1.0, (epoch - args.curriculum_epochs) / args.curriculum_ramp_epochs)
         else:
             lambda_fine = 1.0
+        lambda_fine = max(lambda_fine, args.min_fine_weight)
 
         # Dynamic Hierarchy Update: re-cluster with evolved features
         if (
@@ -142,6 +146,24 @@ def train(model, train_loader, eval_loader_unlabelled, extract_loader, args):
 
                 loss = fine_logits.new_zeros(())
                 pstr = f'[Curriculum: {lambda_fine:.2f}] '
+
+                cls_loss = fine_logits.new_zeros(())
+                sup_con_loss_global = fine_logits.new_zeros(())
+                if mask_lab.any():
+                    sup_logits = torch.cat(
+                        [f[mask_lab] for f in (fine_logits / 0.1).chunk(args.n_views)],
+                        dim=0,
+                    )
+                    sup_labels = torch.cat(
+                        [class_labels[mask_lab] for _ in range(args.n_views)],
+                        dim=0,
+                    )
+                    cls_loss = nn.CrossEntropyLoss()(sup_logits, sup_labels)
+                    if args.old_anchor_weight > 0:
+                        loss += args.old_anchor_weight * cls_loss
+                        pstr += f'old_ce: {cls_loss.item():.3f} '
+                elif args.old_anchor_weight > 0:
+                    pstr += 'old_ce: off '
                 
                 # ==========================================
                 # A: Coarse Level Losses (Layer K e.g. 7)
@@ -191,17 +213,6 @@ def train(model, train_loader, eval_loader_unlabelled, extract_loader, args):
                     contrastive_loss = nn.CrossEntropyLoss()(contrastive_logits, contrastive_labels)
 
                     if mask_lab.any():
-                        # 1. Supervised classification (labeled only)
-                        sup_logits = torch.cat(
-                            [f[mask_lab] for f in (fine_logits / 0.1).chunk(args.n_views)],
-                            dim=0,
-                        )
-                        sup_labels = torch.cat(
-                            [class_labels[mask_lab] for _ in range(args.n_views)],
-                            dim=0,
-                        )
-                        cls_loss = nn.CrossEntropyLoss()(sup_logits, sup_labels)
-
                         # 4. Supervised contrastive (SupCon)
                         sp_chunked = torch.cat(
                             [f[mask_lab].unsqueeze(1) for f in fine_proj.chunk(args.n_views)],
@@ -209,9 +220,6 @@ def train(model, train_loader, eval_loader_unlabelled, extract_loader, args):
                         )
                         sp_normed = F.normalize(sp_chunked, dim=-1)
                         sup_con_loss_global = SupConLoss()(sp_normed, labels=class_labels[mask_lab])
-                    else:
-                        cls_loss = fine_logits.new_zeros(())
-                        sup_con_loss_global = fine_logits.new_zeros(())
                     
                     fine_loss = (1 - args.sup_weight) * cluster_loss + args.sup_weight * cls_loss
                     fine_loss += (1 - args.sup_weight) * contrastive_loss + args.sup_weight * sup_con_loss_global
@@ -241,9 +249,9 @@ def train(model, train_loader, eval_loader_unlabelled, extract_loader, args):
 
         args.logger.info('Train Epoch: {} Avg Loss: {:.4f} '.format(epoch, loss_record.avg))
 
-        # Evaluate on the unlabelled training examples only.
+        # Evaluate on the unlabelled training examples for continuity with GCD debugging logs.
         args.logger.info('Testing on unlabelled training examples only...')
-        all_acc, old_acc, new_acc = test(
+        train_all_acc, train_old_acc, train_new_acc = test(
             model,
             eval_loader_unlabelled,
             epoch=epoch,
@@ -251,7 +259,24 @@ def train(model, train_loader, eval_loader_unlabelled, extract_loader, args):
             args=args,
         )
         
-        args.logger.info('Train Accuracies: All {:.4f} | Old {:.4f} | New {:.4f}'.format(all_acc, old_acc, new_acc))
+        args.logger.info('Train Accuracies: All {:.4f} | Old {:.4f} | New {:.4f}'.format(
+            train_all_acc, train_old_acc, train_new_acc
+        ))
+
+        if eval_loader_test is not None:
+            args.logger.info('Testing on held-out test examples...')
+            all_acc, old_acc, new_acc = test(
+                model,
+                eval_loader_test,
+                epoch=epoch,
+                save_name='Test ACC',
+                args=args,
+            )
+            args.logger.info('Test Accuracies: All {:.4f} | Old {:.4f} | New {:.4f}'.format(
+                all_acc, old_acc, new_acc
+            ))
+        else:
+            all_acc, old_acc, new_acc = train_all_acc, train_old_acc, train_new_acc
 
         exp_lr_scheduler.step()
 
@@ -273,10 +298,16 @@ def train(model, train_loader, eval_loader_unlabelled, extract_loader, args):
                 'hierarchy_layers': args.hierarchy_layers,
                 'backbone_lr_mult': args.backbone_lr_mult,
                 'coarse_loss_weight': args.coarse_loss_weight,
+                'sup_weight': args.sup_weight,
+                'old_anchor_weight': args.old_anchor_weight,
+                'memax_weight': args.memax_weight,
                 'contrastive_temp': args.contrastive_temp,
                 'curriculum_epochs': args.curriculum_epochs,
                 'curriculum_ramp_epochs': args.curriculum_ramp_epochs,
+                'min_fine_weight': args.min_fine_weight,
                 'hierarchy_rebuild_interval': args.hierarchy_rebuild_interval,
+                'rs_train_ratio': args.rs_train_ratio,
+                'image_split_seed': args.image_split_seed,
                 'disable_hierarchy': args.disable_hierarchy,
                 'single_layer_hierarchy': args.single_layer_hierarchy,
                 'disable_bridge': args.disable_bridge,
@@ -287,6 +318,24 @@ def train(model, train_loader, eval_loader_unlabelled, extract_loader, args):
             }
         }
         torch.save(save_dict, args.model_path)
+
+        checkpoint_dir = os.path.dirname(args.model_path)
+        if all_acc > best_all_acc:
+            best_all_acc = all_acc
+            torch.save(save_dict, os.path.join(checkpoint_dir, 'model_best_all.pt'))
+            args.logger.info(
+                'Best All checkpoint updated: All {:.4f} | Old {:.4f} | New {:.4f}'.format(
+                    all_acc, old_acc, new_acc
+                )
+            )
+        if old_acc > best_old_acc:
+            best_old_acc = old_acc
+            torch.save(save_dict, os.path.join(checkpoint_dir, 'model_best_old.pt'))
+            args.logger.info(
+                'Best Old checkpoint updated: All {:.4f} | Old {:.4f} | New {:.4f}'.format(
+                    all_acc, old_acc, new_acc
+                )
+            )
 
 
 def test(model, test_loader, epoch, save_name, args):
@@ -333,6 +382,10 @@ if __name__ == "__main__":
                         help='Class split for AID/NWPU. Ignored by existing generic GCD datasets.')
     parser.add_argument('--class_split_seed', type=int, default=0,
                         help='Seed for random old/novel class split on AID/NWPU.')
+    parser.add_argument('--image_split_seed', type=int, default=0,
+                        help='Seed for the per-class train/test image split on AID/NWPU.')
+    parser.add_argument('--rs_train_ratio', type=float, default=0.7,
+                        help='Per-class train ratio for AID/NWPU image splits.')
     parser.add_argument('--prop_train_labels', type=float, default=0.5)
     parser.add_argument('--use_ssb_splits', action='store_true', default=True)
 
@@ -370,11 +423,15 @@ if __name__ == "__main__":
     parser.add_argument('--exp_root', type=str, default=exp_root)
     parser.add_argument('--transform', type=str, default='imagenet')
     parser.add_argument('--sup_weight', type=float, default=0.35)
+    parser.add_argument('--old_anchor_weight', type=float, default=0.0,
+                        help='Always-on supervised CE weight for labelled old-class samples.')
     parser.add_argument('--coarse_loss_weight', type=float, default=0.5)
     parser.add_argument('--contrastive_temp', type=float, default=0.5)
     parser.add_argument('--n_views', default=2, type=int)
     parser.add_argument('--curriculum_epochs', default=10, type=int)
     parser.add_argument('--curriculum_ramp_epochs', default=10, type=int)
+    parser.add_argument('--min_fine_weight', default=0.0, type=float,
+                        help='Minimum fine-loss weight during the coarse-to-fine curriculum.')
     parser.add_argument('--hierarchy_rebuild_interval', default=0, type=int)
     parser.add_argument('--uniform_sampler', action='store_true', default=False)
     
@@ -460,6 +517,10 @@ if __name__ == "__main__":
 
     label_len = len(train_dataset.labelled_dataset)
     unlabelled_len = len(train_dataset.unlabelled_dataset)
+    args.logger.info(
+        f"Dataset sizes: labelled={label_len} | unlabelled={unlabelled_len} | "
+        f"test={len(test_dataset)}"
+    )
     # Balanced sampling between labelled old-class data and unlabelled GCD data.
     if args.uniform_sampler:
         sample_weights = [1.0 for _ in range(len(train_dataset))]
@@ -472,6 +533,8 @@ if __name__ == "__main__":
                               shuffle=False, sampler=sampler, drop_last=True, pin_memory=True)
     test_loader_unlabelled = DataLoader(unlabelled_train_examples_test, num_workers=args.num_workers,
                                         batch_size=256, shuffle=False, pin_memory=False)
+    test_loader = DataLoader(test_dataset, num_workers=args.num_workers,
+                             batch_size=256, shuffle=False, pin_memory=False)
 
     import copy
     extract_dataset = copy.deepcopy(train_dataset)
@@ -486,4 +549,4 @@ if __name__ == "__main__":
     # We only build the hierarchy purely as a prior targets cache ONCE, 
     # since DINO is frozen.
     args.logger.info("Initializing baseline DINO backbone and testing data flow...")
-    train(model, train_loader, test_loader_unlabelled, extract_loader, args)
+    train(model, train_loader, test_loader_unlabelled, test_loader, extract_loader, args)

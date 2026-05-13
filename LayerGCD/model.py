@@ -183,15 +183,16 @@ class PromptGuidedDINO(nn.Module):
         self.num_fine_classes = num_classes
 
         # Two distinct heads for tracking macro and micro concepts
+        coarse_head_dim = 768 * 2
         self.coarse_head = None if (fine_prompt_only or no_prompts) else DINOHead(
-            in_dim=768, out_dim=num_coarse_classes, nlayers=3
+            in_dim=coarse_head_dim, out_dim=num_coarse_classes, nlayers=3
         )
         fine_head_dim = 768 if no_prompts else 768 * 2
         self.fine_head = DINOHead(in_dim=fine_head_dim, out_dim=num_classes, nlayers=3)
         
         # Bridge MLP to pass structural priors from P_coarse to P_fine
         self.bridge_mlp = nn.Sequential(
-            nn.Linear(768, 768),
+            nn.Linear(coarse_head_dim, 768),
             nn.GELU(),
             nn.Linear(768, 768)
         )
@@ -245,8 +246,10 @@ class PromptGuidedDINO(nn.Module):
             if (not self.fine_prompt_only) and i == self.coarse_layer_idx:
                 # Extract P_coarse tokens after the coarse checkpoint block.
                 # Average-pool the N_p coarse tokens into a single representation.
-                coarse_raw = x[:, 1:1+N_p, :].mean(dim=1)
-                coarse_feat = self.dino.norm(coarse_raw)
+                coarse_prompt = x[:, 1:1+N_p, :].mean(dim=1)
+                coarse_prompt = self.dino.norm(coarse_prompt)
+                coarse_cls = self.dino.norm(x)[:, 0, :]
+                coarse_feat = torch.cat([coarse_cls, coarse_prompt], dim=-1)
 
                 # Get coarse supervised classification / projection
                 coarse_proj, coarse_logits = self.coarse_head(coarse_feat)

@@ -53,6 +53,8 @@ def get_datasets(dataset_name, train_transform, test_transform, args):
             prop_train_labels=args.prop_train_labels,
             split_train_val=False,
             seed=getattr(args, 'class_split_seed', 0),
+            train_ratio=getattr(args, 'rs_train_ratio', 0.7),
+            image_split_seed=getattr(args, 'image_split_seed', 0),
         )
     else:
         datasets = get_dataset_f(train_transform=train_transform, test_transform=test_transform,
