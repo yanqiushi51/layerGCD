@@ -135,7 +135,7 @@ class PromptGuidedDINO(nn.Module):
     """
     def __init__(self, num_classes, extract_layers=(7, 11), num_coarse_classes=None,
                  num_prompt_tokens=4, disable_bridge=False, fine_prompt_only=False,
-                 no_prompts=False):
+                 no_prompts=False, grad_from_block=11, use_local_pooling=True):
         super().__init__()
         from network import build_multilayer_dino
 
@@ -150,7 +150,7 @@ class PromptGuidedDINO(nn.Module):
         self.dino_feature_extractor = build_multilayer_dino(
             pretrained=True, 
             extract_layers=extract_layers,
-            grad_from_block=11  # Fix 3: unfreeze last block
+            grad_from_block=grad_from_block
         )
         self.dino = self.dino_feature_extractor.backbone
         
@@ -158,6 +158,7 @@ class PromptGuidedDINO(nn.Module):
         self.disable_bridge = disable_bridge
         self.fine_prompt_only = fine_prompt_only
         self.no_prompts = no_prompts
+        self.use_local_pooling = use_local_pooling and not no_prompts
             
         # Multi-token learnable prompts for stronger representational capacity
         if no_prompts:
@@ -187,7 +188,7 @@ class PromptGuidedDINO(nn.Module):
         self.coarse_head = None if (fine_prompt_only or no_prompts) else DINOHead(
             in_dim=coarse_head_dim, out_dim=num_coarse_classes, nlayers=3
         )
-        fine_head_dim = 768 if no_prompts else 768 * 2
+        fine_head_dim = 768 if no_prompts else 768 * (3 if self.use_local_pooling else 2)
         self.fine_head = DINOHead(in_dim=fine_head_dim, out_dim=num_classes, nlayers=3)
         
         # Bridge MLP to pass structural priors from P_coarse to P_fine
@@ -265,13 +266,27 @@ class PromptGuidedDINO(nn.Module):
         # Final layer normalization
         x = self.dino.norm(x)
         
-        # Fix 1: concat DINO [CLS] with P_fine for maximum power
+        # Fine prediction uses global CLS, prompt summary, and optionally
+        # prompt-guided local evidence from patch tokens.
         cls_feat = x[:, 0, :]
         fine_prompt_feat = x[:, fine_start:fine_end, :].mean(dim=1)
-        fine_feat = torch.cat([cls_feat, fine_prompt_feat], dim=-1)  # [B, 1536]
+        fine_parts = [cls_feat, fine_prompt_feat]
+        if self.use_local_pooling:
+            patch_tokens = x[:, fine_end:, :]
+            local_feat = self._prompt_guided_local_pool(fine_prompt_feat, patch_tokens)
+            fine_parts.append(local_feat)
+        fine_feat = torch.cat(fine_parts, dim=-1)
         fine_proj, fine_logits = self.fine_head(fine_feat)
         
         return coarse_logits, fine_logits, coarse_feat, fine_feat, coarse_proj, fine_proj
+
+    @staticmethod
+    def _prompt_guided_local_pool(query, patch_tokens):
+        query = F.normalize(query, dim=-1).unsqueeze(1)
+        keys = F.normalize(patch_tokens, dim=-1)
+        attn = torch.matmul(query, keys.transpose(1, 2)).squeeze(1)
+        attn = F.softmax(attn, dim=-1)
+        return torch.bmm(attn.unsqueeze(1), patch_tokens).squeeze(1)
 
 
 # ============================================================

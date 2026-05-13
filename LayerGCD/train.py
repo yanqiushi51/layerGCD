@@ -65,6 +65,27 @@ def get_num_clusters_per_level(extract_layers, total_classes, min_classes=8):
     return n_clusters_per_level
 
 
+def coarse_fine_consistency_loss(fine_logits, coarse_logits, fine_to_coarse, temperature=0.1):
+    """Align coarse predictions with fine predictions aggregated through the hierarchy."""
+    fine_probs = F.softmax(fine_logits / temperature, dim=1)
+    coarse_probs = F.softmax(coarse_logits / temperature, dim=1)
+    mapping = F.one_hot(fine_to_coarse, num_classes=coarse_logits.size(1)).float()
+    fine_as_coarse = fine_probs @ mapping
+
+    eps = 1e-8
+    fine_as_coarse = fine_as_coarse.clamp_min(eps)
+    coarse_probs = coarse_probs.clamp_min(eps)
+    kl_coarse_to_fine = torch.sum(
+        coarse_probs * (torch.log(coarse_probs) - torch.log(fine_as_coarse)),
+        dim=1,
+    )
+    kl_fine_to_coarse = torch.sum(
+        fine_as_coarse * (torch.log(fine_as_coarse) - torch.log(coarse_probs)),
+        dim=1,
+    )
+    return 0.5 * (kl_coarse_to_fine + kl_fine_to_coarse).mean()
+
+
 def train(model, train_loader, eval_loader_unlabelled, eval_loader_test, extract_loader, args):
     device = next(model.parameters()).device
     params_groups = get_params_groups(
@@ -93,7 +114,10 @@ def train(model, train_loader, eval_loader_unlabelled, eval_loader_test, extract
             extract_layers=args.hierarchy_layers,
             n_labeled=args.num_labeled_classes,
             n_unlabeled=args.num_unlabeled_classes,
-            min_classes=args.hierarchy_min_classes
+            min_classes=args.hierarchy_min_classes,
+            use_label_anchors=not args.disable_label_anchored_hierarchy,
+            label_anchor_weight=args.label_anchor_weight,
+            seeded_kmeans_iters=args.seeded_kmeans_iters,
         )
         args.logger.info("Building initial hierarchy tree (coarse targets)...")
         hierarchy_tree.build_hierarchy(model.dino_feature_extractor, extract_loader, device=device)
@@ -180,6 +204,26 @@ def train(model, train_loader, eval_loader_unlabelled, eval_loader_test, extract
                     loss += args.coarse_loss_weight * loss_coarse
                 else:
                     pstr += 'loss_c: off '
+
+                if (
+                    hierarchy_tree is not None
+                    and coarse_logits is not None
+                    and args.coarse_fine_consistency_weight > 0
+                ):
+                    coarsest_layer = args.hierarchy_layers[0]
+                    fine_to_coarse = hierarchy_tree.get_fine_to_level_mapping(
+                        coarsest_layer,
+                        device=fine_logits.device,
+                    )
+                    cgc_loss = coarse_fine_consistency_loss(
+                        fine_logits,
+                        coarse_logits,
+                        fine_to_coarse,
+                        temperature=args.consistency_temp,
+                    )
+                    cgc_weight = args.coarse_fine_consistency_weight * lambda_fine
+                    loss += cgc_weight * cgc_loss
+                    pstr += f'cgc: {cgc_loss.item():.3f} '
 
                 # ==========================================
                 # B: Fine Level Losses (curriculum-gated)
@@ -306,6 +350,12 @@ def train(model, train_loader, eval_loader_unlabelled, eval_loader_test, extract
                 'curriculum_ramp_epochs': args.curriculum_ramp_epochs,
                 'min_fine_weight': args.min_fine_weight,
                 'hierarchy_rebuild_interval': args.hierarchy_rebuild_interval,
+                'disable_label_anchored_hierarchy': args.disable_label_anchored_hierarchy,
+                'label_anchor_weight': args.label_anchor_weight,
+                'seeded_kmeans_iters': args.seeded_kmeans_iters,
+                'coarse_fine_consistency_weight': args.coarse_fine_consistency_weight,
+                'consistency_temp': args.consistency_temp,
+                'disable_local_pooling': args.disable_local_pooling,
                 'rs_train_ratio': args.rs_train_ratio,
                 'image_split_seed': args.image_split_seed,
                 'disable_hierarchy': args.disable_hierarchy,
@@ -393,11 +443,17 @@ if __name__ == "__main__":
     parser.add_argument('--extract_layers', nargs='+', type=int, default=[7, 9, 11, 12], 
                         help='DINO block indices to extract CLS token from')
     parser.add_argument('--grad_from_block', type=int, default=7,
-                        help='Unused in prompt-guided mode; DINO is fully frozen')
+                        help='Fine-tune DINO transformer blocks from this 0-indexed block onward.')
     parser.add_argument('--hierarchy_update_interval', type=int, default=5,
                         help='Unused in prompt-guided mode; hierarchy is built once')
     parser.add_argument('--hierarchy_min_classes', type=int, default=8,
                         help='Minimum number of hierarchy clusters at the coarsest level')
+    parser.add_argument('--disable_label_anchored_hierarchy', action='store_true', default=False,
+                        help='Use pure KMeans instead of anchoring finest old slots with labelled old classes.')
+    parser.add_argument('--label_anchor_weight', type=float, default=10.0,
+                        help='Strength of labelled old class anchors during seeded finest-level clustering.')
+    parser.add_argument('--seeded_kmeans_iters', type=int, default=10,
+                        help='Number of assignment/update iterations for label-anchored finest clustering.')
     parser.add_argument('--num_prompt_tokens', type=int, default=4,
                         help='Number of learnable prompt tokens per branch')
     parser.add_argument('--disable_hierarchy', action='store_true', default=False,
@@ -410,6 +466,8 @@ if __name__ == "__main__":
                         help='Remove the coarse prompt branch and train only the fine prompt.')
     parser.add_argument('--no_prompts', action='store_true', default=False,
                         help='Remove all prompt tokens and train the classifier on DINO CLS only.')
+    parser.add_argument('--disable_local_pooling', action='store_true', default=False,
+                        help='Disable P_fine-guided local patch pooling in the fine head.')
     parser.add_argument('--disable_relation_relaxation', action='store_true', default=False,
                         help='Use standard InfoNCE without hierarchy-aware confusion weights.')
     parser.add_argument('--relation_relaxation_mode', type=str, default='multi', choices=['multi', 'coarse'],
@@ -426,6 +484,10 @@ if __name__ == "__main__":
     parser.add_argument('--old_anchor_weight', type=float, default=0.0,
                         help='Always-on supervised CE weight for labelled old-class samples.')
     parser.add_argument('--coarse_loss_weight', type=float, default=0.5)
+    parser.add_argument('--coarse_fine_consistency_weight', type=float, default=0.1,
+                        help='Weight for cross-granularity consistency between coarse logits and aggregated fine logits.')
+    parser.add_argument('--consistency_temp', type=float, default=0.1,
+                        help='Temperature for coarse-fine consistency probabilities.')
     parser.add_argument('--contrastive_temp', type=float, default=0.5)
     parser.add_argument('--n_views', default=2, type=int)
     parser.add_argument('--curriculum_epochs', default=10, type=int)
@@ -492,6 +554,14 @@ if __name__ == "__main__":
         f"Hierarchy layers: {args.hierarchy_layers} | schedule: {args.num_clusters_per_level} | "
         f"coarse classes: {args.num_coarse_classes}"
     )
+    args.logger.info(
+        f"Label-anchored hierarchy: {not args.disable_label_anchored_hierarchy} | "
+        f"anchor_weight: {args.label_anchor_weight} | CGC weight: {args.coarse_fine_consistency_weight} | "
+        f"local_pooling: {not args.disable_local_pooling}"
+    )
+    args.logger.info(
+        f"Backbone grad_from_block: {args.grad_from_block} | backbone_lr_mult: {args.backbone_lr_mult}"
+    )
     
     model = PromptGuidedDINO(
         num_classes=total_classes,
@@ -501,6 +571,8 @@ if __name__ == "__main__":
         disable_bridge=args.disable_bridge,
         fine_prompt_only=args.fine_prompt_only,
         no_prompts=args.no_prompts,
+        grad_from_block=args.grad_from_block,
+        use_local_pooling=not args.disable_local_pooling,
     ).to(device)
 
     args.logger.info('Models built')

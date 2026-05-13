@@ -22,7 +22,9 @@ class HierarchicalClusterTree:
     - Shallower layers (e.g., 11, 9, 7) → progressively coarser clustering
     """
     
-    def __init__(self, extract_layers, n_labeled, n_unlabeled, min_classes=8):
+    def __init__(self, extract_layers, n_labeled, n_unlabeled, min_classes=8,
+                 use_label_anchors=True, label_anchor_weight=10.0,
+                 seeded_kmeans_iters=10):
         """
         Args:
             extract_layers: Sorted list of DINO block indices
@@ -34,6 +36,9 @@ class HierarchicalClusterTree:
         self.n_labeled = n_labeled
         self.n_unlabeled = n_unlabeled
         self.min_classes = min_classes
+        self.use_label_anchors = use_label_anchors
+        self.label_anchor_weight = label_anchor_weight
+        self.seeded_kmeans_iters = seeded_kmeans_iters
         
         # Compute number of clusters per level
         # Deepest layer → K, then halve going to shallower layers
@@ -48,6 +53,7 @@ class HierarchicalClusterTree:
         self.pseudo_labels = {}   # layer_idx → [n_samples]
         self.cluster_radii = {}   # layer_idx → [n_clusters]
         self.index_to_position = {}
+        self.fine_to_level = {}   # layer_idx → [n_fine_clusters], fine slot to level cluster
     
     @torch.no_grad()
     def build_hierarchy(self, model, dataloader, device='cuda'):
@@ -118,13 +124,25 @@ class HierarchicalClusterTree:
         feats_np = all_features[deepest_layer].numpy()
         
         n_clusters = self.n_clusters_per_level[deepest_layer]
-        print(f'  Level {deepest_layer}: KMeans with K={n_clusters}')
+        if self.use_label_anchors and self.n_labeled > 0 and all_masks.any():
+            print(
+                f'  Level {deepest_layer}: seeded KMeans with '
+                f'{self.n_labeled} old anchors + {self.n_unlabeled} novel slots'
+            )
+            centers, preds = self._seeded_fine_clustering(
+                feats_np,
+                all_labels.numpy(),
+                all_masks.numpy().astype(bool),
+            )
+        else:
+            print(f'  Level {deepest_layer}: KMeans with K={n_clusters}')
+            kmeans = KMeans(n_clusters=n_clusters, random_state=0, n_init=10)
+            preds = kmeans.fit_predict(feats_np)
+            centers = kmeans.cluster_centers_
         
-        kmeans = KMeans(n_clusters=n_clusters, random_state=0, n_init=10)
-        preds = kmeans.fit_predict(feats_np)
-        
-        self.prototypes[deepest_layer] = torch.from_numpy(kmeans.cluster_centers_).float()
+        self.prototypes[deepest_layer] = torch.from_numpy(centers).float()
         self.pseudo_labels[deepest_layer] = torch.from_numpy(preds).long()
+        self.fine_to_level[deepest_layer] = torch.arange(n_clusters, dtype=torch.long)
         self._compute_radii(deepest_layer, all_features[deepest_layer])
         
         # Step 3: Build coarser levels by clustering prototypes
@@ -169,12 +187,102 @@ class HierarchicalClusterTree:
 
             self.prototypes[layer_idx] = torch.from_numpy(layer_kmeans.cluster_centers_).float()
             self.pseudo_labels[layer_idx] = torch.from_numpy(refined_preds).long()
+            self.fine_to_level[layer_idx] = self._majority_map_from_fine(
+                fine_labels=self.pseudo_labels[deepest_layer].numpy(),
+                level_labels=refined_preds,
+                n_fine=self.n_clusters_per_level[deepest_layer],
+                n_level=n_clusters,
+            )
             self._compute_radii(layer_idx, all_features[layer_idx])
             
             prev_layer = layer_idx
         
         model.train()
         print(f'  Hierarchy built: {self.get_hierarchy_summary()}')
+
+    def _seeded_fine_clustering(self, features, labels, labelled_mask):
+        n_clusters = self.n_clusters_per_level[max(self.extract_layers)]
+        if n_clusters != self.n_labeled + self.n_unlabeled:
+            raise ValueError(
+                "Label-anchored hierarchy expects the finest level to have "
+                f"{self.n_labeled + self.n_unlabeled} clusters, got {n_clusters}"
+            )
+
+        old_centers = []
+        fallback_kmeans = KMeans(n_clusters=n_clusters, random_state=0, n_init=10)
+        fallback_kmeans.fit(features)
+        fallback_centers = fallback_kmeans.cluster_centers_
+
+        for class_idx in range(self.n_labeled):
+            class_mask = labelled_mask & (labels == class_idx)
+            if class_mask.any():
+                old_centers.append(features[class_mask].mean(axis=0))
+            else:
+                old_centers.append(fallback_centers[class_idx])
+
+        if self.n_unlabeled > 0:
+            residual = features[~labelled_mask]
+            if len(residual) < self.n_unlabeled:
+                residual = features
+            novel_kmeans = KMeans(n_clusters=self.n_unlabeled, random_state=0, n_init=10)
+            novel_kmeans.fit(residual)
+            centers = np.concatenate([np.stack(old_centers), novel_kmeans.cluster_centers_], axis=0)
+        else:
+            centers = np.stack(old_centers)
+
+        centers = self._l2_normalize_np(centers)
+        labelled_old_mask = labelled_mask & (labels < self.n_labeled)
+        preds = np.zeros(len(features), dtype=np.int64)
+
+        for _ in range(self.seeded_kmeans_iters):
+            sims = features @ centers.T
+            preds = sims.argmax(axis=1).astype(np.int64)
+            preds[labelled_old_mask] = labels[labelled_old_mask].astype(np.int64)
+
+            new_centers = np.zeros_like(centers)
+            for cluster_idx in range(n_clusters):
+                assigned = preds == cluster_idx
+                if cluster_idx < self.n_labeled:
+                    anchor_mask = labelled_mask & (labels == cluster_idx)
+                    if anchor_mask.any():
+                        anchor = features[anchor_mask].mean(axis=0, keepdims=True)
+                        if assigned.any():
+                            assigned_sum = features[assigned].sum(axis=0, keepdims=True)
+                            numerator = assigned_sum + self.label_anchor_weight * anchor
+                            denom = assigned.sum() + self.label_anchor_weight
+                            new_centers[cluster_idx] = (numerator / denom)[0]
+                        else:
+                            new_centers[cluster_idx] = anchor[0]
+                    elif assigned.any():
+                        new_centers[cluster_idx] = features[assigned].mean(axis=0)
+                    else:
+                        new_centers[cluster_idx] = centers[cluster_idx]
+                elif assigned.any():
+                    new_centers[cluster_idx] = features[assigned].mean(axis=0)
+                else:
+                    new_centers[cluster_idx] = centers[cluster_idx]
+            centers = self._l2_normalize_np(new_centers)
+
+        sims = features @ centers.T
+        preds = sims.argmax(axis=1).astype(np.int64)
+        preds[labelled_old_mask] = labels[labelled_old_mask].astype(np.int64)
+        return centers, preds
+
+    @staticmethod
+    def _l2_normalize_np(array):
+        norms = np.linalg.norm(array, axis=1, keepdims=True)
+        norms[norms == 0] = 1
+        return array / norms
+
+    @staticmethod
+    def _majority_map_from_fine(fine_labels, level_labels, n_fine, n_level):
+        mapping = np.zeros(n_fine, dtype=np.int64)
+        for fine_idx in range(n_fine):
+            mask = fine_labels == fine_idx
+            if mask.any():
+                counts = np.bincount(level_labels[mask], minlength=n_level)
+                mapping[fine_idx] = int(counts.argmax())
+        return torch.from_numpy(mapping).long()
     
     def _compute_radii(self, layer_idx, features):
         """Compute cluster radii for a given level."""
@@ -209,6 +317,12 @@ class HierarchicalClusterTree:
             positions = self._resolve_positions(indices)
             return labels[positions]
         return labels
+
+    def get_fine_to_level_mapping(self, layer_idx, device=None):
+        mapping = self.fine_to_level[layer_idx]
+        if device is not None:
+            mapping = mapping.to(device)
+        return mapping
 
     def _resolve_positions(self, indices):
         if torch.is_tensor(indices):
