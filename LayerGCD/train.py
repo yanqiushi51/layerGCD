@@ -1,17 +1,20 @@
 """
 Main training script for LayerGCD.
 
-Combines DINO multi-layer feature hierarchy with 
+Combines DINO multi-layer feature hierarchy with
 hierarchical clustering tree for Generalized Category Discovery.
 """
 
 import argparse
+import copy
 import math
 import numpy as np
 import os
+import sys
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from pathlib import Path
 from torch.optim import SGD, lr_scheduler
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -25,6 +28,17 @@ from config import exp_root
 from model import PromptGuidedDINO, SupConLoss, info_nce_logits, DistillLoss, ContrastiveLearningViewGenerator
 from hierarchy import HierarchicalClusterTree
 
+_SELEX_ROOT = Path(__file__).resolve().parents[1] / "baselines" / "SelEx"
+_SELEX_CLUSTER_DIR = _SELEX_ROOT / "methods" / "clustering"
+if _SELEX_ROOT.exists():
+    sys.path.append(str(_SELEX_ROOT))
+if _SELEX_CLUSTER_DIR.exists():
+    sys.path.append(str(_SELEX_CLUSTER_DIR))
+try:
+    from faster_mix_k_means_pytorch import K_Means as SemiSupKMeans
+except Exception:
+    SemiSupKMeans = None
+
 
 def get_params_groups(model, base_lr=0.1, backbone_lr_mult=0.001):
     """Use a smaller LR for the unfrozen DINO block than for prompts/heads."""
@@ -32,7 +46,7 @@ def get_params_groups(model, base_lr=0.1, backbone_lr_mult=0.001):
     head_not_reg = []
     backbone_reg = []
     backbone_not_reg = []
-    
+
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
@@ -41,7 +55,7 @@ def get_params_groups(model, base_lr=0.1, backbone_lr_mult=0.001):
             (backbone_not_reg if is_backbone else head_not_reg).append(param)
         else:
             (backbone_reg if is_backbone else head_reg).append(param)
-    
+
     groups = []
     if head_reg:
         groups.append({'params': head_reg, 'lr': base_lr})
@@ -57,14 +71,14 @@ def get_params_groups(model, base_lr=0.1, backbone_lr_mult=0.001):
     return groups
 
 
-def get_num_clusters_per_level(extract_layers, n_labeled, n_unlabeled, min_classes=8):
+def get_num_clusters_per_level(extract_layers, total_classes, min_classes=8):
     """Mirror HierarchicalClusterTree's cluster schedule for model construction."""
     n_clusters_per_level = {}
-    cur_labeled, cur_unlabeled = n_labeled, n_unlabeled
-    for layer_idx in reversed(extract_layers):
-        n_clusters_per_level[layer_idx] = cur_labeled + cur_unlabeled
-        cur_labeled = max(int(cur_labeled / 2), 1)
-        cur_unlabeled = max(int(cur_unlabeled / 2), 1)
+    for i, layer_idx in enumerate(reversed(extract_layers)):
+        n_clusters_per_level[layer_idx] = min(
+            total_classes,
+            max(total_classes // (2 ** i), min_classes),
+        )
     return n_clusters_per_level
 
 
@@ -89,7 +103,8 @@ def coarse_fine_consistency_loss(fine_logits, coarse_logits, fine_to_coarse, tem
     return 0.5 * (kl_coarse_to_fine + kl_fine_to_coarse).mean()
 
 
-def train(model, train_loader, eval_loader_unlabelled, eval_loader_test, extract_loader, args):
+def train(model, train_loader, eval_loader_unlabelled, eval_loader_test, extract_loader,
+          eval_loader_labelled, args):
     device = next(model.parameters()).device
     params_groups = get_params_groups(
         model,
@@ -97,7 +112,7 @@ def train(model, train_loader, eval_loader_unlabelled, eval_loader_test, extract
         backbone_lr_mult=args.backbone_lr_mult,
     )
     optimizer = SGD(params_groups, lr=args.lr, momentum=args.momentum, weight_decay=args.weight_decay)
-    
+
     fp16_scaler = None
     if args.fp16:
         fp16_scaler = torch.cuda.amp.GradScaler()
@@ -110,7 +125,7 @@ def train(model, train_loader, eval_loader_unlabelled, eval_loader_test, extract
         args.warmup_teacher_temp_epochs, args.epochs, args.n_views,
         args.warmup_teacher_temp, args.teacher_temp
     )
-    
+
     hierarchy_tree = None
     if not args.disable_hierarchy:
         hierarchy_tree = HierarchicalClusterTree(
@@ -154,22 +169,22 @@ def train(model, train_loader, eval_loader_unlabelled, eval_loader_test, extract
             hierarchy_tree.build_hierarchy(model.dino_feature_extractor, extract_loader, device=device)
 
         model.train()
-        
+
         for batch_idx, batch in enumerate(train_loader):
             images, class_labels, uq_idxs, mask_lab = batch
             mask_lab = mask_lab[:, 0]
 
             class_labels = class_labels.to(device, non_blocking=True)
             mask_lab = mask_lab.to(device, non_blocking=True).bool()
-            
+
             # Combine augmented views into a single batch.
             images = torch.cat(images, dim=0).to(device, non_blocking=True)
             optimizer.zero_grad(set_to_none=True)
-            
+
             with torch.cuda.amp.autocast(fp16_scaler is not None):
                 # 1. Forward pass: Prompts
                 coarse_logits, fine_logits, coarse_feat, fine_feat, coarse_proj, fine_proj = model(images)
-                
+
                 teacher_out_fine = fine_logits.detach()
 
                 loss = fine_logits.new_zeros(())
@@ -192,7 +207,7 @@ def train(model, train_loader, eval_loader_unlabelled, eval_loader_test, extract
                         pstr += f'old_ce: {cls_loss.item():.3f} '
                 elif args.old_anchor_weight > 0:
                     pstr += 'old_ce: off '
-                
+
                 # ==========================================
                 # A: Coarse Level Losses (Layer K e.g. 7)
                 # ==========================================
@@ -235,12 +250,12 @@ def train(model, train_loader, eval_loader_unlabelled, eval_loader_test, extract
                 if lambda_fine > 0:
                     # 2. Unsupervised clustering (DistillLoss)
                     cluster_loss = cluster_criterion(fine_logits, teacher_out_fine, epoch)
-                    
+
                     # ME-MAX (entropy maximization)
                     avg_probs = (fine_logits / 0.1).softmax(dim=1).mean(dim=0)
                     me_max_loss = math.log(float(len(avg_probs))) + torch.sum(avg_probs * torch.log(avg_probs + 1e-8))
                     cluster_loss += args.memax_weight * me_max_loss
-                    
+
                     # 3. InfoNCE with semantic-aware repulsion
                     confusion = None
                     if hierarchy_tree is not None and not args.disable_relation_relaxation:
@@ -268,20 +283,20 @@ def train(model, train_loader, eval_loader_unlabelled, eval_loader_test, extract
                         )
                         sp_normed = F.normalize(sp_chunked, dim=-1)
                         sup_con_loss_global = SupConLoss()(sp_normed, labels=class_labels[mask_lab])
-                    
+
                     fine_loss = (1 - args.sup_weight) * cluster_loss + args.sup_weight * cls_loss
                     fine_loss += (1 - args.sup_weight) * contrastive_loss + args.sup_weight * sup_con_loss_global
-                    
+
                     loss += lambda_fine * fine_loss
-                    
+
                     pstr += f'cls_f: {cls_loss.item():.3f} clu_f: {cluster_loss.item():.3f} '
                     pstr += f'con_f: {contrastive_loss.item():.3f} sup_f: {sup_con_loss_global.item():.3f} '
                 else:
                     pstr += 'fine: off '
-                
+
                 # Optimization step
             loss_record.update(loss.item(), class_labels.size(0))
-            
+
             if fp16_scaler is None:
                 loss.backward()
                 optimizer.step()
@@ -305,7 +320,7 @@ def train(model, train_loader, eval_loader_unlabelled, eval_loader_test, extract
             save_name='Train ACC Unlabelled Examples',
             args=args,
         )
-        
+
         args.logger.info('Train Accuracies: All {:.4f} | Old {:.4f} | New {:.4f}'.format(
             train_all_acc, train_old_acc, train_new_acc
         ))
@@ -324,6 +339,42 @@ def train(model, train_loader, eval_loader_unlabelled, eval_loader_test, extract
             ))
         else:
             all_acc, old_acc, new_acc = train_all_acc, train_old_acc, train_new_acc
+
+        if (
+            args.eval_sskmeans_interval > 0
+            and eval_loader_labelled is not None
+            and ((epoch + 1) % args.eval_sskmeans_interval == 0 or epoch == args.epochs - 1)
+        ):
+            feature_modes = ['fine_feat', 'fine_proj'] if args.sskmeans_features == 'both' else [args.sskmeans_features]
+            for feature_mode in feature_modes:
+                args.logger.info(
+                    f'Testing SS-KMeans assignment on unlabelled training examples '
+                    f'with {feature_mode}...'
+                )
+                test_ss_kmeans(
+                    model,
+                    eval_loader_labelled,
+                    eval_loader_unlabelled,
+                    epoch=epoch,
+                    save_name=f'SS-KMeans Train ACC Unlabelled Examples ({feature_mode})',
+                    args=args,
+                    feature_mode=feature_mode,
+                )
+
+                if eval_loader_test is not None:
+                    args.logger.info(
+                        f'Testing SS-KMeans assignment on held-out test examples '
+                        f'with {feature_mode}...'
+                    )
+                    test_ss_kmeans(
+                        model,
+                        eval_loader_labelled,
+                        eval_loader_test,
+                        epoch=epoch,
+                        save_name=f'SS-KMeans Test ACC ({feature_mode})',
+                        args=args,
+                        feature_mode=feature_mode,
+                    )
 
         exp_lr_scheduler.step()
 
@@ -370,6 +421,8 @@ def train(model, train_loader, eval_loader_unlabelled, eval_loader_test, extract
                 'no_prompts': args.no_prompts,
                 'disable_relation_relaxation': args.disable_relation_relaxation,
                 'relation_relaxation_mode': args.relation_relaxation_mode,
+                'eval_sskmeans_interval': args.eval_sskmeans_interval,
+                'sskmeans_features': args.sskmeans_features,
             }
         }
         torch.save(save_dict, args.model_path)
@@ -393,13 +446,158 @@ def train(model, train_loader, eval_loader_unlabelled, eval_loader_test, extract
             )
 
 
+@torch.no_grad()
+def extract_assignment_features(model, loader, args, feature_mode):
+    model.eval()
+    device = next(model.parameters()).device
+
+    feats, targets = [], []
+    mask = np.array([])
+
+    for batch in tqdm(loader):
+        if len(batch) == 4:
+            images, label, _, _ = batch
+        else:
+            images, label, _ = batch
+        images = images[0] if isinstance(images, list) else images
+        images = images.to(device, non_blocking=True)
+
+        _, _, _, fine_feat, _, fine_proj = model(images)
+        if feature_mode == 'fine_feat':
+            batch_feats = fine_feat
+        elif feature_mode == 'fine_proj':
+            batch_feats = fine_proj
+        else:
+            raise ValueError(f"Unknown SS-KMeans feature mode: {feature_mode}")
+
+        feats.append(F.normalize(batch_feats, dim=-1).cpu().numpy())
+        label_np = label.cpu().numpy()
+        targets.append(label_np)
+        mask = np.append(mask, label_np < args.num_labeled_classes)
+
+    return np.concatenate(feats), np.concatenate(targets), mask.astype(bool)
+
+
+def fit_semi_supervised_kmeans(labelled_feats, labelled_targets, target_feats, args, device):
+    n_clusters = args.num_labeled_classes + args.num_unlabeled_classes
+
+    if SemiSupKMeans is not None and torch.cuda.is_available():
+        cluster_size = math.ceil((len(labelled_feats) + len(target_feats)) / n_clusters)
+        kmeans = SemiSupKMeans(
+            k=n_clusters,
+            tolerance=1e-4,
+            max_iterations=10,
+            init='k-means++',
+            n_init=1,
+            random_state=None,
+            n_jobs=None,
+            pairwise_batch_size=1024,
+            mode=None,
+            protos=None,
+            cluster_size=cluster_size,
+        )
+        l_feats = torch.from_numpy(labelled_feats).to(device)
+        u_feats = torch.from_numpy(target_feats).to(device)
+        l_targets = torch.from_numpy(labelled_targets.astype(np.int64)).to(device)
+        kmeans.fit_mix(u_feats, l_feats, l_targets)
+        return kmeans.labels_.detach().cpu().numpy().astype(np.int64)[len(labelled_feats):]
+
+    return fallback_semi_supervised_kmeans(
+        labelled_feats,
+        labelled_targets,
+        target_feats,
+        n_clusters=n_clusters,
+        n_iters=10,
+    )
+
+
+def fallback_semi_supervised_kmeans(labelled_feats, labelled_targets, target_feats,
+                                   n_clusters, n_iters=10):
+    labelled_targets = labelled_targets.astype(np.int64)
+    unique_targets = np.unique(labelled_targets)
+
+    old_centers = []
+    for target in unique_targets:
+        target_mask = labelled_targets == target
+        old_centers.append(labelled_feats[target_mask].mean(axis=0))
+    old_centers = np.stack(old_centers, axis=0)
+
+    n_novel = n_clusters - len(unique_targets)
+    if n_novel > 0:
+        from sklearn.cluster import KMeans
+
+        novel_kmeans = KMeans(n_clusters=n_novel, random_state=0, n_init=10)
+        novel_kmeans.fit(target_feats)
+        centers = np.concatenate([old_centers, novel_kmeans.cluster_centers_], axis=0)
+    else:
+        centers = old_centers
+
+    centers = centers / np.maximum(np.linalg.norm(centers, axis=1, keepdims=True), 1e-12)
+    all_feats = np.concatenate([labelled_feats, target_feats], axis=0)
+    labelled_mask = np.zeros(len(all_feats), dtype=bool)
+    labelled_mask[:len(labelled_feats)] = True
+    preds = np.zeros(len(all_feats), dtype=np.int64)
+    target_to_slot = {target: slot for slot, target in enumerate(unique_targets)}
+
+    for _ in range(n_iters):
+        preds = (all_feats @ centers.T).argmax(axis=1).astype(np.int64)
+        for target, slot in target_to_slot.items():
+            labelled_pos = np.flatnonzero(labelled_targets == target)
+            preds[labelled_pos] = slot
+
+        new_centers = np.zeros_like(centers)
+        for cluster_idx in range(n_clusters):
+            assigned = preds == cluster_idx
+            new_centers[cluster_idx] = all_feats[assigned].mean(axis=0) if assigned.any() else centers[cluster_idx]
+        centers = new_centers / np.maximum(np.linalg.norm(new_centers, axis=1, keepdims=True), 1e-12)
+
+    preds = (all_feats @ centers.T).argmax(axis=1).astype(np.int64)
+    for target, slot in target_to_slot.items():
+        labelled_pos = np.flatnonzero(labelled_targets == target)
+        preds[labelled_pos] = slot
+    return preds[len(labelled_feats):]
+
+
+def test_ss_kmeans(model, labelled_loader, target_loader, epoch, save_name, args, feature_mode):
+    device = next(model.parameters()).device
+    labelled_feats, labelled_targets, _ = extract_assignment_features(
+        model,
+        labelled_loader,
+        args,
+        feature_mode,
+    )
+    target_feats, target_targets, target_old_mask = extract_assignment_features(
+        model,
+        target_loader,
+        args,
+        feature_mode,
+    )
+
+    preds = fit_semi_supervised_kmeans(
+        labelled_feats,
+        labelled_targets,
+        target_feats,
+        args,
+        device,
+    )
+    return log_accs_from_preds(
+        y_true=target_targets,
+        y_pred=preds,
+        mask=target_old_mask,
+        T=epoch,
+        eval_funcs=args.eval_funcs,
+        save_name=save_name,
+        args=args,
+    )
+
+
 def test(model, test_loader, epoch, save_name, args):
     model.eval()
     device = next(model.parameters()).device
 
     preds, targets = [], []
     mask = np.array([])
-    
+
     for batch in tqdm(test_loader):
         if len(batch) == 4:
             images, label, _, _ = batch
@@ -408,11 +606,11 @@ def test(model, test_loader, epoch, save_name, args):
         images = images.to(device, non_blocking=True)
         with torch.no_grad():
             coarse_logits, logits, coarse_feat, fine_feat, coarse_proj, fine_proj = model(images)
-            
+
             global_logits = logits
             preds.append(global_logits.argmax(1).cpu().numpy())
             targets.append(label.cpu().numpy())
-            
+
             label_np = label.cpu().numpy()
             mask = np.append(mask, label_np < args.num_labeled_classes)
 
@@ -449,7 +647,7 @@ if __name__ == "__main__":
     parser.add_argument('--use_ssb_splits', action='store_true', default=True)
 
     # Multi-layer arguments
-    parser.add_argument('--extract_layers', nargs='+', type=int, default=[7, 9, 11, 12], 
+    parser.add_argument('--extract_layers', nargs='+', type=int, default=[7, 9, 11, 12],
                         help='DINO block indices to extract CLS token from')
     parser.add_argument('--grad_from_block', type=int, default=7,
                         help='Fine-tune DINO transformer blocks from this 0-indexed block onward.')
@@ -505,7 +703,7 @@ if __name__ == "__main__":
                         help='Minimum fine-loss weight during the coarse-to-fine curriculum.')
     parser.add_argument('--hierarchy_rebuild_interval', default=10, type=int)
     parser.add_argument('--uniform_sampler', action='store_true', default=False)
-    
+
     parser.add_argument('--memax_weight', type=float, default=2)
     parser.add_argument('--warmup_teacher_temp', default=0.07, type=float)
     parser.add_argument('--teacher_temp', default=0.04, type=float)
@@ -514,6 +712,11 @@ if __name__ == "__main__":
     parser.add_argument('--fp16', action='store_true', default=False)
     parser.add_argument('--print_freq', default=10, type=int)
     parser.add_argument('--exp_name', default=None, type=str)
+    parser.add_argument('--eval_sskmeans_interval', type=int, default=0,
+                        help='If >0, evaluate feature + semi-supervised k-means assignment every N epochs.')
+    parser.add_argument('--sskmeans_features', type=str, default='fine_feat',
+                        choices=['fine_feat', 'fine_proj', 'both'],
+                        help='Feature space used for SS-KMeans assignment evaluation.')
 
     args = parser.parse_args()
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
@@ -524,7 +727,7 @@ if __name__ == "__main__":
 
     init_experiment(args, runner_name=['layergcd'])
     args.logger.info(f'Using evaluation function {args.eval_funcs[0]} to print results')
-    
+
     torch.backends.cudnn.benchmark = True
 
     # ----------------------
@@ -537,7 +740,7 @@ if __name__ == "__main__":
 
     # Ensure extract layers are unique and sorted
     args.extract_layers = sorted(list(set(args.extract_layers)))
-    
+
     # In DINO ViT-B, final block is index 11 (0 to 11). "Layer 12" often means block 11
     # Adjust indexing if 12 is passed
     if 12 in args.extract_layers:
@@ -551,8 +754,7 @@ if __name__ == "__main__":
     args.hierarchy_layers = [max(args.extract_layers)] if args.single_layer_hierarchy else list(args.extract_layers)
     args.num_clusters_per_level = get_num_clusters_per_level(
         args.hierarchy_layers,
-        args.num_labeled_classes,
-        args.num_unlabeled_classes,
+        total_classes,
         min_classes=args.hierarchy_min_classes,
     )
     args.num_coarse_classes = args.num_clusters_per_level[args.hierarchy_layers[0]]
@@ -578,7 +780,7 @@ if __name__ == "__main__":
             f"rs_labelled_count={args.rs_labelled_count}. This matches published counts where possible, "
             "but does not imply access to the authors' exact split."
         )
-    
+
     model = PromptGuidedDINO(
         num_classes=total_classes,
         extract_layers=args.extract_layers,
@@ -598,7 +800,7 @@ if __name__ == "__main__":
     # --------------------
     train_transform, test_transform = get_transform(args.transform, image_size=args.image_size, args=args)
     train_transform_view = ContrastiveLearningViewGenerator(base_transform=train_transform, n_views=args.n_views)
-    
+
     train_dataset, test_dataset, unlabelled_train_examples_test, datasets = get_datasets(
         args.dataset_name, train_transform_view, test_transform, args
     )
@@ -617,24 +819,36 @@ if __name__ == "__main__":
     sample_weights = torch.DoubleTensor(sample_weights)
     sampler = torch.utils.data.WeightedRandomSampler(sample_weights, num_samples=len(train_dataset))
 
-    train_loader = DataLoader(train_dataset, num_workers=args.num_workers, batch_size=args.batch_size, 
+    train_loader = DataLoader(train_dataset, num_workers=args.num_workers, batch_size=args.batch_size,
                               shuffle=False, sampler=sampler, drop_last=True, pin_memory=True)
     test_loader_unlabelled = DataLoader(unlabelled_train_examples_test, num_workers=args.num_workers,
                                         batch_size=256, shuffle=False, pin_memory=False)
     test_loader = DataLoader(test_dataset, num_workers=args.num_workers,
                              batch_size=256, shuffle=False, pin_memory=False)
 
-    import copy
     extract_dataset = copy.deepcopy(train_dataset)
     extract_dataset.labelled_dataset.transform = test_transform
     extract_dataset.unlabelled_dataset.transform = test_transform
     extract_loader = DataLoader(extract_dataset, num_workers=args.num_workers,
                                 batch_size=256, shuffle=False, pin_memory=False)
 
+    labelled_eval_dataset = copy.deepcopy(datasets['train_labelled'])
+    labelled_eval_dataset.transform = test_transform
+    labelled_eval_loader = DataLoader(labelled_eval_dataset, num_workers=args.num_workers,
+                                      batch_size=256, shuffle=False, pin_memory=False)
+
     # ----------------------
     # TRAIN
     # ----------------------
-    # We only build the hierarchy purely as a prior targets cache ONCE, 
+    # We only build the hierarchy purely as a prior targets cache ONCE,
     # since DINO is frozen.
     args.logger.info("Initializing baseline DINO backbone and testing data flow...")
-    train(model, train_loader, test_loader_unlabelled, test_loader, extract_loader, args)
+    train(
+        model,
+        train_loader,
+        test_loader_unlabelled,
+        test_loader,
+        extract_loader,
+        labelled_eval_loader,
+        args,
+    )
