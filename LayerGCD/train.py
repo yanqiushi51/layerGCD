@@ -351,7 +351,7 @@ def train(model, train_loader, eval_loader_unlabelled, eval_loader_test, extract
                     f'Testing SS-KMeans assignment on unlabelled training examples '
                     f'with {feature_mode}...'
                 )
-                test_ss_kmeans(
+                ss_all, ss_old, ss_new = test_ss_kmeans(
                     model,
                     eval_loader_labelled,
                     eval_loader_unlabelled,
@@ -360,13 +360,17 @@ def train(model, train_loader, eval_loader_unlabelled, eval_loader_test, extract
                     args=args,
                     feature_mode=feature_mode,
                 )
+                args.logger.info(
+                    f'SS-KMeans Train ({feature_mode}): '
+                    f'All {ss_all:.4f} | Old {ss_old:.4f} | New {ss_new:.4f}'
+                )
 
                 if eval_loader_test is not None:
                     args.logger.info(
                         f'Testing SS-KMeans assignment on held-out test examples '
                         f'with {feature_mode}...'
                     )
-                    test_ss_kmeans(
+                    ss_all, ss_old, ss_new = test_ss_kmeans(
                         model,
                         eval_loader_labelled,
                         eval_loader_test,
@@ -374,6 +378,10 @@ def train(model, train_loader, eval_loader_unlabelled, eval_loader_test, extract
                         save_name=f'SS-KMeans Test ACC ({feature_mode})',
                         args=args,
                         feature_mode=feature_mode,
+                    )
+                    args.logger.info(
+                        f'SS-KMeans Test ({feature_mode}): '
+                        f'All {ss_all:.4f} | Old {ss_old:.4f} | New {ss_new:.4f}'
                     )
 
         exp_lr_scheduler.step()
