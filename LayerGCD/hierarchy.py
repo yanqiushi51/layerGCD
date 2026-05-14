@@ -23,12 +23,18 @@ except Exception:
 
 class HierarchicalClusterTree:
     """
-    Builds and maintains a multi-level clustering hierarchy.
-    
-    Unlike SelEx (which uses dimension slicing on the same features), 
-    this uses features from different DINO layers for different hierarchy levels:
-    - Deepest DINO layer (e.g., 12) → finest clustering (full K classes)
-    - Shallower layers (e.g., 11, 9, 7) → progressively coarser clustering
+    Builds and maintains a SelEx-style semi-supervised hierarchy.
+
+    The hierarchy follows SelEx's class-count schedule and constrained
+    clustering semantics:
+    - Finest level: SemiSupKMeans over K old slots plus N novel slots.
+    - Coarser levels: halve old and novel slots separately.
+    - Old fine slots are merged by KMeans, then used as labelled anchors for
+      SemiSupKMeans at the next coarser level.
+
+    LayerGCD still names hierarchy levels by DINO layer indices so downstream
+    model code can reuse the existing layer interface, but the clustering
+    procedure is the SelEx BSSK/HSSK-style construction.
     """
     
     def __init__(self, extract_layers, n_labeled, n_unlabeled, min_classes=8,
@@ -68,13 +74,13 @@ class HierarchicalClusterTree:
     def build_hierarchy(self, model, dataloader, device='cuda'):
         """
         Build the full hierarchy tree.
-        
+
         Process:
         1. Extract features from all layers for all samples
-        2. At the deepest layer: run KMeans with full K clusters
-        3. At each shallower layer: cluster the previous level's prototypes
-           to get coarser groupings, then reassign samples using that layer's features
-        
+        2. At the finest level: run SelEx SemiSupKMeans with old labels fixed
+        3. At each coarser level: merge old prototypes, then run SelEx
+           SemiSupKMeans with samples assigned to old fine slots as labelled
+
         Args:
             model: MultiLayerDINO model
             dataloader: DataLoader for the training set
