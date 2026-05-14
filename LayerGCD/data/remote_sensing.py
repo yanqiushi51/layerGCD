@@ -342,7 +342,8 @@ def get_remote_sensing_class_splits(dataset_name, split_type="random", seed=0):
 def get_remote_sensing_datasets(dataset_name, train_transform, test_transform,
                                 train_classes, prop_train_labels=0.5,
                                 split_train_val=False, seed=0,
-                                train_ratio=0.7, image_split_seed=0):
+                                train_ratio=0.7, image_split_seed=0,
+                                labelled_count=None):
     if split_train_val:
         raise NotImplementedError("Remote sensing datasets use the GCD train/unlabelled protocol only.")
 
@@ -368,10 +369,23 @@ def get_remote_sensing_datasets(dataset_name, train_transform, test_transform,
         if target in old_class_set
     ]
     labelled_dataset = _subsample_dataset(deepcopy(train_pool), np.array(old_indices))
-    subsample_indices = subsample_instances(
-        labelled_dataset,
-        prop_indices_to_subsample=prop_train_labels,
-    )
+    if labelled_count is None:
+        subsample_indices = subsample_instances(
+            labelled_dataset,
+            prop_indices_to_subsample=prop_train_labels,
+        )
+    else:
+        labelled_count = int(labelled_count)
+        if labelled_count < 1 or labelled_count > len(labelled_dataset):
+            raise ValueError(
+                f"labelled_count must be in [1, {len(labelled_dataset)}], got {labelled_count}"
+            )
+        np.random.seed(0)
+        subsample_indices = np.random.choice(
+            range(len(labelled_dataset)),
+            replace=False,
+            size=(labelled_count,),
+        )
     labelled_dataset = _subsample_dataset(labelled_dataset, subsample_indices)
 
     labelled_global_paths = {path for path, _ in labelled_dataset.samples}

@@ -358,6 +358,8 @@ def train(model, train_loader, eval_loader_unlabelled, eval_loader_test, extract
                 'disable_local_pooling': args.disable_local_pooling,
                 'rs_train_ratio': args.rs_train_ratio,
                 'image_split_seed': args.image_split_seed,
+                'rs_labelled_count': args.rs_labelled_count,
+                'rs_match_paper_counts': args.rs_match_paper_counts,
                 'disable_hierarchy': args.disable_hierarchy,
                 'single_layer_hierarchy': args.single_layer_hierarchy,
                 'disable_bridge': args.disable_bridge,
@@ -436,6 +438,10 @@ if __name__ == "__main__":
                         help='Seed for the per-class train/test image split on AID/NWPU.')
     parser.add_argument('--rs_train_ratio', type=float, default=0.7,
                         help='Per-class train ratio for AID/NWPU image splits.')
+    parser.add_argument('--rs_labelled_count', type=int, default=None,
+                        help='Optional exact number of labelled old-class training images for AID/NWPU.')
+    parser.add_argument('--rs_match_paper_counts', action='store_true', default=False,
+                        help='Use published table counts when available. Currently sets AID labelled=1758.')
     parser.add_argument('--prop_train_labels', type=float, default=0.5)
     parser.add_argument('--use_ssb_splits', action='store_true', default=True)
 
@@ -562,6 +568,12 @@ if __name__ == "__main__":
     args.logger.info(
         f"Backbone grad_from_block: {args.grad_from_block} | backbone_lr_mult: {args.backbone_lr_mult}"
     )
+    if args.rs_labelled_count is not None or args.rs_match_paper_counts:
+        args.logger.info(
+            f"Remote-sensing paper-count alignment: match_paper_counts={args.rs_match_paper_counts} | "
+            f"rs_labelled_count={args.rs_labelled_count}. This matches published counts where possible, "
+            "but does not imply access to the authors' exact split."
+        )
     
     model = PromptGuidedDINO(
         num_classes=total_classes,
