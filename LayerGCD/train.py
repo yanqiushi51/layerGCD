@@ -547,6 +547,7 @@ if __name__ == "__main__":
 
     args.logger.info(f"Extracting DINO layers: {args.extract_layers}")
 
+    total_classes = args.num_labeled_classes + args.num_unlabeled_classes
     args.hierarchy_layers = [max(args.extract_layers)] if args.single_layer_hierarchy else list(args.extract_layers)
     args.num_clusters_per_level = get_num_clusters_per_level(
         args.hierarchy_layers,
