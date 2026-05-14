@@ -1,15 +1,24 @@
-"""
-Hierarchical clustering module for LayerGCD.
+"""Hierarchical clustering module for LayerGCD."""
 
-Builds a multi-level clustering tree where each level uses features
-from a different DINO layer, creating a natural semantic hierarchy.
-"""
-
+import math
 import numpy as np
+import sys
 import torch
 import torch.nn.functional as F
+from pathlib import Path
 from sklearn.cluster import KMeans
 from tqdm import tqdm
+
+_SELEX_ROOT = Path(__file__).resolve().parents[1] / "baselines" / "SelEx"
+_SELEX_CLUSTER_DIR = _SELEX_ROOT / "methods" / "clustering"
+if _SELEX_ROOT.exists():
+    sys.path.append(str(_SELEX_ROOT))
+if _SELEX_CLUSTER_DIR.exists():
+    sys.path.append(str(_SELEX_CLUSTER_DIR))
+try:
+    from faster_mix_k_means_pytorch import K_Means as SelExSemiSupKMeans
+except Exception:
+    SelExSemiSupKMeans = None
 
 
 class HierarchicalClusterTree:
@@ -40,13 +49,13 @@ class HierarchicalClusterTree:
         self.label_anchor_weight = label_anchor_weight
         self.seeded_kmeans_iters = seeded_kmeans_iters
         
-        # Compute number of clusters per level
-        # Deepest layer → K, then halve going to shallower layers
-        total_classes = n_labeled + n_unlabeled
+        # SelEx halves known and novel slots separately at each higher level.
         self.n_clusters_per_level = {}
-        for i, layer_idx in enumerate(reversed(extract_layers)):
-            n_cls = min(total_classes, max(total_classes // (2 ** i), min_classes))
-            self.n_clusters_per_level[layer_idx] = n_cls
+        cur_labeled, cur_unlabeled = n_labeled, n_unlabeled
+        for layer_idx in reversed(extract_layers):
+            self.n_clusters_per_level[layer_idx] = cur_labeled + cur_unlabeled
+            cur_labeled = max(int(cur_labeled / 2), 1)
+            cur_unlabeled = max(int(cur_unlabeled / 2), 1)
         
         # Storage for prototypes and pseudo-labels
         self.prototypes = {}      # layer_idx → [n_clusters, feat_dim]
@@ -118,21 +127,22 @@ class HierarchicalClusterTree:
             int(sample_idx): pos for pos, sample_idx in enumerate(all_indices.tolist())
         }
         
-        # Step 2: SelEx-style bottom-up hierarchy construction
-        # Use one shared embedding space (deepest layer features) to build all levels.
+        # Step 2: SelEx hierarchy construction in one shared embedding space.
         deepest_layer = max(self.extract_layers)
         base_feats_np = all_features[deepest_layer].numpy()
         
         n_clusters = self.n_clusters_per_level[deepest_layer]
-        if self.use_label_anchors and self.n_labeled > 0 and all_masks.any():
+        if self.n_labeled > 0 and all_masks.any():
             print(
-                f'  Level {deepest_layer}: seeded KMeans with '
-                f'{self.n_labeled} old anchors + {self.n_unlabeled} novel slots'
+                f'  Level {deepest_layer}: SelEx SemiSupKMeans with '
+                f'{self.n_labeled} old slots + {self.n_unlabeled} novel slots'
             )
-            centers, preds = self._seeded_fine_clustering(
-                base_feats_np,
-                all_labels.numpy(),
-                all_masks.numpy().astype(bool),
+            centers, preds = self._selex_fit_mix(
+                features=base_feats_np,
+                labelled_mask=all_masks.numpy().astype(bool),
+                labelled_targets=all_labels.numpy(),
+                n_clusters=n_clusters,
+                device=device,
             )
         else:
             print(f'  Level {deepest_layer}: KMeans with K={n_clusters}')
@@ -145,41 +155,31 @@ class HierarchicalClusterTree:
         self.fine_to_level[deepest_layer] = torch.arange(n_clusters, dtype=torch.long)
         self._compute_radii(deepest_layer, all_features[deepest_layer])
         
-        # Step 3: Build coarser levels in SelEx style:
-        # 1) Merge previous "known" prototypes into fewer known groups
-        # 2) Treat samples assigned to previous known clusters as fixed-labeled
-        # 3) Run constrained KMeans over the same base feature space
-        prev_layer = deepest_layer
-        prev_known_slots = self.n_labeled
-        prev_total_slots = self.n_clusters_per_level[deepest_layer]
+        # Step 3 mirrors SelEx: cluster original old prototypes, then run
+        # SemiSupKMeans with samples assigned to old fine slots as labelled.
+        label_proto = centers[:self.n_labeled]
+        fine_preds = preds
+        mask_known = fine_preds < self.n_labeled
+        cur_labeled, cur_unlabeled = self.n_labeled, self.n_unlabeled
         for layer_idx in reversed(self.extract_layers[:-1]):
+            cur_labeled = max(int(cur_labeled / 2), 1)
+            cur_unlabeled = max(int(cur_unlabeled / 2), 1)
             n_clusters = self.n_clusters_per_level[layer_idx]
-            known_slots = int(round(n_clusters * (prev_known_slots / max(prev_total_slots, 1))))
-            known_slots = max(1, min(known_slots, n_clusters - 1))
             print(
-                f'  Level {layer_idx}: SelEx-style constrained clustering '
-                f'K={n_clusters} (known={known_slots}, novel={n_clusters - known_slots})'
+                f'  Level {layer_idx}: SelEx SemiSupKMeans '
+                f'K={n_clusters} (known={cur_labeled}, novel={cur_unlabeled})'
             )
 
-            # Merge previous known prototypes -> current known groups
-            prev_protos_np = self.prototypes[prev_layer].numpy()
-            prev_pseudo = self.pseudo_labels[prev_layer].numpy()
-            prev_known_proto = prev_protos_np[:prev_known_slots]
-            known_merger = KMeans(n_clusters=known_slots, random_state=0, n_init=10)
-            known_merger.fit(prev_known_proto)
-            merged_known_labels = known_merger.labels_
+            label_merger = KMeans(n_clusters=cur_labeled, random_state=0)
+            label_merger.fit(label_proto)
+            merged_old_labels = label_merger.labels_
 
-            prev_known_mask = prev_pseudo < prev_known_slots
-            fixed_mask = prev_known_mask.copy()
-            fixed_labels = np.zeros_like(prev_pseudo)
-            fixed_labels[fixed_mask] = merged_known_labels[prev_pseudo[fixed_mask]]
-
-            centers_np, refined_preds = self._semi_supervised_level_clustering(
+            centers_np, refined_preds = self._selex_fit_mix(
                 features=base_feats_np,
-                fixed_mask=fixed_mask,
-                fixed_labels=fixed_labels,
+                labelled_mask=mask_known,
+                labelled_targets=merged_old_labels[fine_preds[mask_known]],
                 n_clusters=n_clusters,
-                n_known=known_slots,
+                device=device,
             )
 
             self.prototypes[layer_idx] = torch.from_numpy(centers_np).float()
@@ -190,11 +190,7 @@ class HierarchicalClusterTree:
                 n_fine=self.n_clusters_per_level[deepest_layer],
                 n_level=n_clusters,
             )
-            self._compute_radii(layer_idx, all_features[layer_idx])
-
-            prev_layer = layer_idx
-            prev_known_slots = known_slots
-            prev_total_slots = n_clusters
+            self._compute_radii(layer_idx, all_features[deepest_layer])
         
         model.train()
         print(f'  Hierarchy built: {self.get_hierarchy_summary()}')
@@ -267,21 +263,59 @@ class HierarchicalClusterTree:
         preds[labelled_old_mask] = labels[labelled_old_mask].astype(np.int64)
         return centers, preds
 
-    def _semi_supervised_level_clustering(self, features, fixed_mask, fixed_labels, n_clusters, n_known):
-        n_novel = n_clusters - n_known
-        fixed_mask = fixed_mask.astype(bool)
-        fixed_labels = fixed_labels.astype(np.int64)
+    def _selex_fit_mix(self, features, labelled_mask, labelled_targets, n_clusters, device):
+        labelled_mask = labelled_mask.astype(bool)
+        labelled_targets = labelled_targets.astype(np.int64)
 
+        if SelExSemiSupKMeans is not None and torch.cuda.is_available() and str(device).startswith('cuda'):
+            l_feats_np = features[labelled_mask]
+            u_feats_np = features[~labelled_mask]
+            l_targets_np = labelled_targets[labelled_mask] if len(labelled_targets) == len(features) else labelled_targets
+            cluster_size = math.ceil(len(features) / n_clusters)
+            kmeans = SelExSemiSupKMeans(
+                k=n_clusters,
+                tolerance=1e-4,
+                max_iterations=10,
+                init='k-means++',
+                n_init=1,
+                random_state=None,
+                n_jobs=None,
+                pairwise_batch_size=1024,
+                mode=None,
+                protos=None,
+                cluster_size=cluster_size,
+            )
+            l_feats = torch.from_numpy(l_feats_np).to(device)
+            u_feats = torch.from_numpy(u_feats_np).to(device)
+            l_targets = torch.from_numpy(l_targets_np).to(device)
+            kmeans.fit_mix(u_feats, l_feats, l_targets)
+
+            concat_preds = kmeans.labels_.detach().cpu().numpy().astype(np.int64)
+            preds = np.empty(len(features), dtype=np.int64)
+            labelled_pos = np.flatnonzero(labelled_mask)
+            unlabelled_pos = np.flatnonzero(~labelled_mask)
+            preds[labelled_pos] = concat_preds[:len(labelled_pos)]
+            preds[unlabelled_pos] = concat_preds[len(labelled_pos):]
+            centers = kmeans.cluster_centers_.detach().cpu().numpy()
+            return self._l2_normalize_np(centers), preds
+
+        return self._fallback_fit_mix(features, labelled_mask, labelled_targets, n_clusters)
+
+    def _fallback_fit_mix(self, features, labelled_mask, labelled_targets, n_clusters):
+        l_feats = features[labelled_mask]
+        l_targets = labelled_targets[labelled_mask] if len(labelled_targets) == len(features) else labelled_targets
+        unique_targets = np.unique(l_targets)
         known_centers = []
-        for cls_idx in range(n_known):
-            cls_mask = fixed_mask & (fixed_labels == cls_idx)
+        for cls_idx in unique_targets:
+            cls_mask = l_targets == cls_idx
             if cls_mask.any():
-                known_centers.append(features[cls_mask].mean(axis=0))
+                known_centers.append(l_feats[cls_mask].mean(axis=0))
             else:
                 known_centers.append(features[np.random.randint(0, len(features))])
         known_centers = np.stack(known_centers, axis=0)
 
-        residual = features[~fixed_mask]
+        n_novel = n_clusters - len(unique_targets)
+        residual = features[~labelled_mask]
         if len(residual) < max(n_novel, 1):
             residual = features
         if n_novel > 0:
@@ -293,23 +327,25 @@ class HierarchicalClusterTree:
         centers = self._l2_normalize_np(centers)
 
         preds = np.zeros(len(features), dtype=np.int64)
+        target_to_slot = {target: slot for slot, target in enumerate(unique_targets)}
         for _ in range(self.seeded_kmeans_iters):
             sims = features @ centers.T
             preds = sims.argmax(axis=1).astype(np.int64)
-            preds[fixed_mask] = fixed_labels[fixed_mask]
+            labelled_pos = np.flatnonzero(labelled_mask)
+            for target, slot in target_to_slot.items():
+                preds[labelled_pos[l_targets == target]] = slot
 
             new_centers = np.zeros_like(centers)
             for cluster_idx in range(n_clusters):
                 assigned = preds == cluster_idx
-                if assigned.any():
-                    new_centers[cluster_idx] = features[assigned].mean(axis=0)
-                else:
-                    new_centers[cluster_idx] = centers[cluster_idx]
+                new_centers[cluster_idx] = features[assigned].mean(axis=0) if assigned.any() else centers[cluster_idx]
             centers = self._l2_normalize_np(new_centers)
 
         sims = features @ centers.T
         preds = sims.argmax(axis=1).astype(np.int64)
-        preds[fixed_mask] = fixed_labels[fixed_mask]
+        labelled_pos = np.flatnonzero(labelled_mask)
+        for target, slot in target_to_slot.items():
+            preds[labelled_pos[l_targets == target]] = slot
         return centers, preds
 
     @staticmethod

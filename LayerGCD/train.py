@@ -57,11 +57,14 @@ def get_params_groups(model, base_lr=0.1, backbone_lr_mult=0.001):
     return groups
 
 
-def get_num_clusters_per_level(extract_layers, total_classes, min_classes=8):
+def get_num_clusters_per_level(extract_layers, n_labeled, n_unlabeled, min_classes=8):
     """Mirror HierarchicalClusterTree's cluster schedule for model construction."""
     n_clusters_per_level = {}
-    for i, layer_idx in enumerate(reversed(extract_layers)):
-        n_clusters_per_level[layer_idx] = min(total_classes, max(total_classes // (2 ** i), min_classes))
+    cur_labeled, cur_unlabeled = n_labeled, n_unlabeled
+    for layer_idx in reversed(extract_layers):
+        n_clusters_per_level[layer_idx] = cur_labeled + cur_unlabeled
+        cur_labeled = max(int(cur_labeled / 2), 1)
+        cur_unlabeled = max(int(cur_unlabeled / 2), 1)
     return n_clusters_per_level
 
 
@@ -544,11 +547,11 @@ if __name__ == "__main__":
 
     args.logger.info(f"Extracting DINO layers: {args.extract_layers}")
 
-    total_classes = args.num_labeled_classes + args.num_unlabeled_classes
     args.hierarchy_layers = [max(args.extract_layers)] if args.single_layer_hierarchy else list(args.extract_layers)
     args.num_clusters_per_level = get_num_clusters_per_level(
         args.hierarchy_layers,
-        total_classes,
+        args.num_labeled_classes,
+        args.num_unlabeled_classes,
         min_classes=args.hierarchy_min_classes,
     )
     args.num_coarse_classes = args.num_clusters_per_level[args.hierarchy_layers[0]]
