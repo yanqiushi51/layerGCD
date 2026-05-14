@@ -372,15 +372,17 @@ def info_nce_logits(features, n_views=2, temperature=1.0, device='cuda', confusi
     labels = labels[~mask].view(labels.shape[0], -1)
     similarity_matrix = similarity_matrix[~mask].view(similarity_matrix.shape[0], -1)
     
-    if confusion_factor is not None:
-        confusion_factor = confusion_factor[~mask].view(confusion_factor.shape[0], -1)
-        # Added to similarity_matrix to reduce repulsion penalty (Semantic Aware Repulsion)
-        similarity_matrix = similarity_matrix + 0.5 * confusion_factor
-
     positives = similarity_matrix[labels.bool()].view(labels.shape[0], -1)
     negatives = similarity_matrix[~labels.bool()].view(similarity_matrix.shape[0], -1)
+    neg_confusion = None
+    if confusion_factor is not None:
+        confusion_factor = confusion_factor[~mask].view(confusion_factor.shape[0], -1)
+        neg_confusion = confusion_factor[~labels.bool()].view(similarity_matrix.shape[0], -1)
 
     positive_logits = torch.logsumexp(positives / temperature, dim=1, keepdim=True)
+    if neg_confusion is not None:
+        # Relax semantically close negatives by lowering their competition in the denominator.
+        negatives = negatives - 0.5 * neg_confusion
     negative_logits = negatives / temperature
 
     logits = torch.cat([positive_logits, negative_logits], dim=1)

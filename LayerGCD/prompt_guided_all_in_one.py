@@ -470,14 +470,16 @@ def info_nce_logits(features, n_views=2, temperature=1.0, device="cuda", confusi
     labels = labels[~mask].view(labels.shape[0], -1)
     similarity_matrix = similarity_matrix[~mask].view(similarity_matrix.shape[0], -1)
 
-    if confusion_factor is not None:
-        confusion_factor = confusion_factor[~mask].view(confusion_factor.shape[0], -1)
-        similarity_matrix = similarity_matrix + 0.5 * confusion_factor
-
     positives = similarity_matrix[labels.bool()].view(labels.shape[0], -1)
     negatives = similarity_matrix[~labels.bool()].view(similarity_matrix.shape[0], -1)
+    neg_confusion = None
+    if confusion_factor is not None:
+        confusion_factor = confusion_factor[~mask].view(confusion_factor.shape[0], -1)
+        neg_confusion = confusion_factor[~labels.bool()].view(similarity_matrix.shape[0], -1)
 
     positive_logits = torch.logsumexp(positives / temperature, dim=1, keepdim=True)
+    if neg_confusion is not None:
+        negatives = negatives - 0.5 * neg_confusion
     negative_logits = negatives / temperature
 
     logits = torch.cat([positive_logits, negative_logits], dim=1)
@@ -627,6 +629,7 @@ def train(model, train_loader, eval_loader_unlabelled, extract_loader, args):
             class_labels = class_labels.to(device, non_blocking=True)
             mask_lab = mask_lab.to(device, non_blocking=True).bool()
             images = torch.cat(images, dim=0).to(device, non_blocking=True)
+            optimizer.zero_grad(set_to_none=True)
 
             with torch.cuda.amp.autocast(fp16_scaler is not None):
                 coarse_logits, fine_logits, _, _, _, fine_proj, prompt_proj = model(images)
@@ -711,7 +714,6 @@ def train(model, train_loader, eval_loader_unlabelled, extract_loader, args):
                     pstr += "fine: off "
 
             loss_record.update(loss.item(), class_labels.size(0))
-            optimizer.zero_grad()
             if fp16_scaler is None:
                 loss.backward()
                 optimizer.step()
@@ -828,7 +830,7 @@ def main():
     parser.add_argument("--n_views", default=2, type=int)
     parser.add_argument("--curriculum_epochs", default=10, type=int)
     parser.add_argument("--curriculum_ramp_epochs", default=10, type=int)
-    parser.add_argument("--hierarchy_rebuild_interval", default=0, type=int)
+    parser.add_argument("--hierarchy_rebuild_interval", default=10, type=int)
     parser.add_argument("--uniform_sampler", action="store_true", default=False)
     parser.add_argument("--memax_weight", type=float, default=2.0)
     parser.add_argument("--warmup_teacher_temp", default=0.07, type=float)

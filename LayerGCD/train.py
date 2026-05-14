@@ -161,6 +161,7 @@ def train(model, train_loader, eval_loader_unlabelled, eval_loader_test, extract
             
             # Combine augmented views into a single batch.
             images = torch.cat(images, dim=0).to(device, non_blocking=True)
+            optimizer.zero_grad(set_to_none=True)
             
             with torch.cuda.amp.autocast(fp16_scaler is not None):
                 # 1. Forward pass: Prompts
@@ -277,7 +278,6 @@ def train(model, train_loader, eval_loader_unlabelled, eval_loader_test, extract
                 
                 # Optimization step
             loss_record.update(loss.item(), class_labels.size(0))
-            optimizer.zero_grad()
             
             if fp16_scaler is None:
                 loss.backward()
@@ -494,7 +494,7 @@ if __name__ == "__main__":
     parser.add_argument('--curriculum_ramp_epochs', default=10, type=int)
     parser.add_argument('--min_fine_weight', default=0.0, type=float,
                         help='Minimum fine-loss weight during the coarse-to-fine curriculum.')
-    parser.add_argument('--hierarchy_rebuild_interval', default=0, type=int)
+    parser.add_argument('--hierarchy_rebuild_interval', default=10, type=int)
     parser.add_argument('--uniform_sampler', action='store_true', default=False)
     
     parser.add_argument('--memax_weight', type=float, default=2)
