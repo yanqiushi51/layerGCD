@@ -720,8 +720,8 @@ if __name__ == "__main__":
     parser.add_argument('--fp16', action='store_true', default=False)
     parser.add_argument('--print_freq', default=10, type=int)
     parser.add_argument('--exp_name', default=None, type=str)
-    parser.add_argument('--eval_sskmeans_interval', type=int, default=0,
-                        help='If >0, evaluate feature + semi-supervised k-means assignment every N epochs.')
+    parser.add_argument('--eval_sskmeans_interval', type=int, default=1,
+                        help='Evaluate feature + semi-supervised k-means assignment every N epochs.')
     parser.add_argument('--sskmeans_features', type=str, default='fine_feat',
                         choices=['fine_feat', 'fine_proj', 'both'],
                         help='Feature space used for SS-KMeans assignment evaluation.')
