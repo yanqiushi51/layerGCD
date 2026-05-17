@@ -46,8 +46,6 @@ def get_datasets(dataset_name, train_transform, test_transform, args):
     get_dataset_f = get_dataset_funcs[dataset_name]
     if dataset_name in ('aid', 'nwpu'):
         labelled_count = getattr(args, 'rs_labelled_count', None)
-        if labelled_count is None and getattr(args, 'rs_match_paper_counts', False):
-            labelled_count = 1758 if dataset_name == 'aid' else None
         datasets = get_dataset_f(
             dataset_name=dataset_name,
             train_transform=train_transform,

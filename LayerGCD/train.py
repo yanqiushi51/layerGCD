@@ -646,18 +646,18 @@ if __name__ == "__main__":
     parser.add_argument('--image_split_seed', type=int, default=0,
                         help='Seed for the per-class train/test image split on AID/NWPU.')
     parser.add_argument('--rs_train_ratio', type=float, default=0.7,
-                        help='Per-class train ratio for AID/NWPU image splits.')
+                        help='Deprecated; AID/NWPU use the full-dataset transductive GCD protocol.')
     parser.add_argument('--rs_labelled_count', type=int, default=None,
                         help='Optional exact number of labelled old-class training images for AID/NWPU.')
     parser.add_argument('--rs_match_paper_counts', action='store_true', default=False,
-                        help='Use published table counts when available. Currently sets AID labelled=1758.')
+                        help='Deprecated; kept for CLI compatibility.')
     parser.add_argument('--prop_train_labels', type=float, default=0.5)
     parser.add_argument('--use_ssb_splits', action='store_true', default=True)
 
     # Multi-layer arguments
     parser.add_argument('--extract_layers', nargs='+', type=int, default=[7, 9, 11, 12],
                         help='DINO block indices to extract CLS token from')
-    parser.add_argument('--grad_from_block', type=int, default=7,
+    parser.add_argument('--grad_from_block', type=int, default=11,
                         help='Fine-tune DINO transformer blocks from this 0-indexed block onward.')
     parser.add_argument('--hierarchy_update_interval', type=int, default=5,
                         help='Unused in prompt-guided mode; hierarchy is built once')
@@ -784,9 +784,8 @@ if __name__ == "__main__":
     )
     if args.rs_labelled_count is not None or args.rs_match_paper_counts:
         args.logger.info(
-            f"Remote-sensing paper-count alignment: match_paper_counts={args.rs_match_paper_counts} | "
-            f"rs_labelled_count={args.rs_labelled_count}. This matches published counts where possible, "
-            "but does not imply access to the authors' exact split."
+            f"Remote-sensing labelled-count override: rs_labelled_count={args.rs_labelled_count}. "
+            "The default protocol labels 50% of old-class images and evaluates on the full dataset."
         )
 
     model = PromptGuidedDINO(

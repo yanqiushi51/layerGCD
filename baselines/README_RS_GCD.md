@@ -22,8 +22,9 @@ The remote-sensing protocol is:
 
 - AID: 15 old / 15 novel classes.
 - NWPU-RESISC45: 22 old / 23 novel classes.
-- Old classes: 50% labelled, remaining 50% unlabelled.
-- Novel classes: all unlabelled.
+- Old-class images: 50% labelled.
+- Remaining old-class images plus all novel-class images: unlabelled.
+- Test/evaluation uses the full dataset.
 - Metrics use the standard `v2` evaluation where Hungarian matching is computed once on all unlabelled samples before reporting All/Old/New.
 
 ## Entrypoints
@@ -37,12 +38,11 @@ The remote-sensing protocol is:
 
 ## Smoke Test
 
-Dataset protocol smoke tests passed locally and on the remote 5090 host for:
+Expected protocol sizes are:
 
 - AID random: `15/15`, `2525/7475/10000` labelled/unlabelled/test.
-- AID confusable: `15/15`, `2635/7365/10000`.
-- NWPU random: `22/23`, `7700/23800/31500`.
-- NWPU confusable: `22/23`, `7700/23800/31500`.
+- AID confusable: `15/15`, `2635/7365/10000` labelled/unlabelled/test.
+- NWPU random/confusable: `22/23`, `7700/23800/31500` labelled/unlabelled/test.
 
 ## Known Runtime Requirements
 

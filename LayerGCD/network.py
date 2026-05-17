@@ -92,8 +92,8 @@ class MultiLayerDINO(nn.Module):
         return len(self.extract_layers)
 
 
-def build_multilayer_dino(pretrained=True, extract_layers=(7, 9, 11), 
-                          grad_from_block=7):
+def build_multilayer_dino(pretrained=True, extract_layers=(7, 9, 11),
+                          grad_from_block=11):
     """
     Build a MultiLayerDINO model.
     
