@@ -296,6 +296,26 @@ def _subsample_dataset(dataset, idxs):
     return dataset
 
 
+def _stratified_train_test_indices(dataset, train_ratio=0.7, seed=0):
+    if not 0.0 < train_ratio < 1.0:
+        raise ValueError(f"train_ratio must be between 0 and 1, got {train_ratio}")
+
+    targets = np.array([target for _, target in dataset.samples])
+    rng = np.random.default_rng(seed)
+    train_indices = []
+    test_indices = []
+
+    for target in sorted(set(targets.tolist())):
+        idxs = np.where(targets == target)[0]
+        idxs = rng.permutation(idxs)
+        n_train = int(round(train_ratio * len(idxs)))
+        n_train = min(max(n_train, 1), len(idxs) - 1)
+        train_indices.extend(idxs[:n_train].tolist())
+        test_indices.extend(idxs[n_train:].tolist())
+
+    return np.array(sorted(train_indices)), np.array(sorted(test_indices))
+
+
 def get_remote_sensing_class_splits(dataset_name, split_type="random", seed=0):
     meta = DATASET_META[dataset_name]
     classes = meta["classes"]
@@ -337,13 +357,19 @@ def get_remote_sensing_datasets(dataset_name, train_transform, test_transform,
         class_names=class_names,
         transform=train_transform,
     )
+    train_indices, test_indices = _stratified_train_test_indices(
+        whole_dataset,
+        train_ratio=train_ratio,
+        seed=image_split_seed,
+    )
+    train_pool = _subsample_dataset(deepcopy(whole_dataset), train_indices)
 
     old_class_set = set(train_classes)
     old_indices = [
-        idx for idx, (_, target) in enumerate(whole_dataset.samples)
+        idx for idx, (_, target) in enumerate(train_pool.samples)
         if target in old_class_set
     ]
-    labelled_dataset = _subsample_dataset(deepcopy(whole_dataset), np.array(old_indices))
+    labelled_dataset = _subsample_dataset(deepcopy(train_pool), np.array(old_indices))
     if labelled_count is None:
         subsample_indices = subsample_instances(
             labelled_dataset,
@@ -365,11 +391,11 @@ def get_remote_sensing_datasets(dataset_name, train_transform, test_transform,
 
     labelled_global_paths = {path for path, _ in labelled_dataset.samples}
     unlabelled_indices = [
-        idx for idx, (path, _) in enumerate(whole_dataset.samples)
+        idx for idx, (path, _) in enumerate(train_pool.samples)
         if path not in labelled_global_paths
     ]
-    unlabelled_dataset = _subsample_dataset(deepcopy(whole_dataset), np.array(unlabelled_indices))
-    test_dataset = deepcopy(whole_dataset)
+    unlabelled_dataset = _subsample_dataset(deepcopy(train_pool), np.array(unlabelled_indices))
+    test_dataset = _subsample_dataset(deepcopy(whole_dataset), test_indices)
     test_dataset.transform = test_transform
 
     return {

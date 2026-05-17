@@ -144,28 +144,25 @@ NWPU_CONFUSABLE_OLD = [
     "freeway",
     "golf course",
     "harbor",
+    "industrial area",
     "lake",
     "mountain",
     "overpass",
+    "parking lot",
     "railway",
-    "stadium",
-    "storage tank",
-    "tennis court",
+    "railway station",
 ]
 
 NWPU_CONFUSABLE_NOVEL = [
     "airplane",
     "church",
     "ground track field",
-    "industrial area",
     "intersection",
     "island",
     "meadow",
     "medium residential",
     "mobile home park",
     "palace",
-    "parking lot",
-    "railway station",
     "rectangular farmland",
     "river",
     "roundabout",
@@ -174,6 +171,9 @@ NWPU_CONFUSABLE_NOVEL = [
     "ship",
     "snowberg",
     "sparse residential",
+    "stadium",
+    "storage tank",
+    "tennis court",
     "terrace",
     "thermal power station",
     "wetland",
@@ -298,6 +298,25 @@ def _subsample_dataset(dataset, idxs):
     return dataset
 
 
+def _stratified_train_test_indices(dataset, train_ratio=0.7, seed=0):
+    rng = np.random.default_rng(seed)
+    by_class = {}
+    for idx, (_, target) in enumerate(dataset.samples):
+        by_class.setdefault(target, []).append(idx)
+
+    train_indices = []
+    test_indices = []
+    for target in sorted(by_class):
+        idxs = np.array(by_class[target])
+        idxs = idxs[rng.permutation(len(idxs))]
+        n_train = int(round(train_ratio * len(idxs)))
+        n_train = min(max(n_train, 1), len(idxs) - 1)
+        train_indices.extend(idxs[:n_train].tolist())
+        test_indices.extend(idxs[n_train:].tolist())
+
+    return np.array(sorted(train_indices)), np.array(sorted(test_indices))
+
+
 def get_remote_sensing_class_splits(dataset_name, split_type="random", seed=0):
     meta = DATASET_META[dataset_name]
     classes = meta["classes"]
@@ -324,7 +343,9 @@ def get_remote_sensing_class_splits(dataset_name, split_type="random", seed=0):
 
 def get_remote_sensing_datasets(dataset_name, train_transform, test_transform,
                                 train_classes, prop_train_labels=0.5,
-                                split_train_val=False, seed=0):
+                                split_train_val=False, seed=0,
+                                train_ratio=0.7, image_split_seed=0,
+                                labelled_count=None):
     if split_train_val:
         raise NotImplementedError("Remote sensing datasets use the GCD train/unlabelled protocol only.")
 
@@ -337,30 +358,46 @@ def get_remote_sensing_datasets(dataset_name, train_transform, test_transform,
         class_names=class_names,
         transform=train_transform,
     )
+    train_indices, test_indices = _stratified_train_test_indices(
+        whole_dataset,
+        train_ratio=train_ratio,
+        seed=image_split_seed,
+    )
+    train_pool = _subsample_dataset(deepcopy(whole_dataset), train_indices)
 
     old_class_set = set(train_classes)
     old_indices = [
-        idx for idx, (_, target) in enumerate(whole_dataset.samples)
+        idx for idx, (_, target) in enumerate(train_pool.samples)
         if target in old_class_set
     ]
-    labelled_dataset = _subsample_dataset(deepcopy(whole_dataset), np.array(old_indices))
-    subsample_indices = subsample_instances(
-        labelled_dataset,
-        prop_indices_to_subsample=prop_train_labels,
-    )
+    labelled_dataset = _subsample_dataset(deepcopy(train_pool), np.array(old_indices))
+    if labelled_count is None:
+        subsample_indices = subsample_instances(
+            labelled_dataset,
+            prop_indices_to_subsample=prop_train_labels,
+        )
+    else:
+        labelled_count = int(labelled_count)
+        if labelled_count < 1 or labelled_count > len(labelled_dataset):
+            raise ValueError(
+                f"labelled_count must be in [1, {len(labelled_dataset)}], got {labelled_count}"
+            )
+        np.random.seed(0)
+        subsample_indices = np.random.choice(
+            range(len(labelled_dataset)),
+            replace=False,
+            size=(labelled_count,),
+        )
     labelled_dataset = _subsample_dataset(labelled_dataset, subsample_indices)
 
     labelled_global_paths = {path for path, _ in labelled_dataset.samples}
     unlabelled_indices = [
-        idx for idx, (path, _) in enumerate(whole_dataset.samples)
+        idx for idx, (path, _) in enumerate(train_pool.samples)
         if path not in labelled_global_paths
     ]
-    unlabelled_dataset = _subsample_dataset(deepcopy(whole_dataset), np.array(unlabelled_indices))
-    test_dataset = RemoteSensingSceneDataset(
-        root=root,
-        class_names=class_names,
-        transform=test_transform,
-    )
+    unlabelled_dataset = _subsample_dataset(deepcopy(train_pool), np.array(unlabelled_indices))
+    test_dataset = _subsample_dataset(deepcopy(whole_dataset), test_indices)
+    test_dataset.transform = test_transform
 
     return {
         "train_labelled": labelled_dataset,

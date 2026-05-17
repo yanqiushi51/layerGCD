@@ -646,7 +646,7 @@ if __name__ == "__main__":
     parser.add_argument('--image_split_seed', type=int, default=0,
                         help='Seed for the per-class train/test image split on AID/NWPU.')
     parser.add_argument('--rs_train_ratio', type=float, default=0.7,
-                        help='Deprecated; AID/NWPU use the full-dataset transductive GCD protocol.')
+                        help='Per-class train image ratio for AID/NWPU held-out evaluation.')
     parser.add_argument('--rs_labelled_count', type=int, default=None,
                         help='Optional exact number of labelled old-class training images for AID/NWPU.')
     parser.add_argument('--rs_match_paper_counts', action='store_true', default=False,
@@ -785,7 +785,7 @@ if __name__ == "__main__":
     if args.rs_labelled_count is not None or args.rs_match_paper_counts:
         args.logger.info(
             f"Remote-sensing labelled-count override: rs_labelled_count={args.rs_labelled_count}. "
-            "The default protocol labels 50% of old-class images and evaluates on the full dataset."
+            "The default protocol labels 50% of old-class train images and evaluates on the held-out test split."
         )
 
     model = PromptGuidedDINO(

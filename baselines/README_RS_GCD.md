@@ -22,9 +22,10 @@ The remote-sensing protocol is:
 
 - AID: 15 old / 15 novel classes.
 - NWPU-RESISC45: 22 old / 23 novel classes.
-- Old-class images: 50% labelled.
-- Remaining old-class images plus all novel-class images: unlabelled.
-- Test/evaluation uses the full dataset.
+- Images are split per class into 70% train / 30% test.
+- Old-class train images: 50% labelled.
+- Remaining old-class train images plus all novel-class train images: unlabelled.
+- Test/evaluation uses the held-out 30% test images.
 - Metrics use the standard `v2` evaluation where Hungarian matching is computed once on all unlabelled samples before reporting All/Old/New.
 
 ## Entrypoints
@@ -40,9 +41,9 @@ The remote-sensing protocol is:
 
 Expected protocol sizes are:
 
-- AID random: `15/15`, `2525/7475/10000` labelled/unlabelled/test.
-- AID confusable: `15/15`, `2635/7365/10000` labelled/unlabelled/test.
-- NWPU random/confusable: `22/23`, `7700/23800/31500` labelled/unlabelled/test.
+- AID random: `15/15`, `1767/5233/3000` labelled/unlabelled/test.
+- AID confusable: `15/15`, `1844/5156/3000` labelled/unlabelled/test.
+- NWPU random/confusable: `22/23`, `5390/16660/9450` labelled/unlabelled/test.
 
 ## Known Runtime Requirements
 
