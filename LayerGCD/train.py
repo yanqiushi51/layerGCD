@@ -110,8 +110,7 @@ def log_coarse_hierarchy_diagnostics(hierarchy_tree, args, prefix='Initial'):
     coarsest_layer = min(hierarchy_tree.extract_layers)
     coarse_labels = hierarchy_tree.pseudo_labels[coarsest_layer].cpu().numpy().astype(int)
     true_labels = hierarchy_tree.sample_labels.cpu().numpy().astype(int)
-    old_mask = hierarchy_tree.sample_old_mask.cpu().numpy().astype(bool)
-    new_mask = ~old_mask
+    true_new_mask = true_labels >= args.num_labeled_classes
 
     purities = []
     new_purities = []
@@ -128,15 +127,16 @@ def log_coarse_hierarchy_diagnostics(hierarchy_tree, args, prefix='Initial'):
         purities.append(float(counts.max() / counts.sum()))
         class_counts.append(int(len(counts)))
 
-        cluster_new = true_labels[cluster_mask & new_mask]
+        cluster_new = true_labels[cluster_mask & true_new_mask]
         if len(cluster_new) > 0:
             _, new_counts = np.unique(cluster_new, return_counts=True)
             new_purities.append(float(new_counts.max() / new_counts.sum()))
             new_class_counts.append(int(len(new_counts)))
 
     new_class_cluster_counts = []
-    for true_class in sorted(np.unique(true_labels[new_mask])):
-        class_coarse = np.unique(coarse_labels[true_labels == true_class])
+    for true_class in sorted(np.unique(true_labels[true_new_mask])):
+        class_mask = (true_labels == true_class) & true_new_mask
+        class_coarse = np.unique(coarse_labels[class_mask])
         new_class_cluster_counts.append(int(len(class_coarse)))
 
     avg_purity = float(np.mean(purities)) if purities else 0.0
@@ -156,7 +156,7 @@ def log_coarse_hierarchy_diagnostics(hierarchy_tree, args, prefix='Initial'):
 
     for cluster_id in range(hierarchy_tree.n_clusters_per_level[coarsest_layer]):
         cluster_mask = coarse_labels == cluster_id
-        cluster_new = true_labels[cluster_mask & new_mask]
+        cluster_new = true_labels[cluster_mask & true_new_mask]
         if len(cluster_new) == 0:
             continue
         classes, counts = np.unique(cluster_new, return_counts=True)
@@ -687,22 +687,33 @@ def log_slot_diagnostics(targets, preds, mask, epoch, save_name, args):
     old_to_new_rate = new_slot_mask[mask].mean() if mask.any() else 0.0
 
     new_slot_preds = preds[new_slot_mask]
-    new_slot_usage = len(np.unique(new_slot_preds))
+    true_new_slot_preds = preds[true_new_mask & new_slot_mask]
+    new_slot_usage_all_predicted_new = len(np.unique(new_slot_preds))
+    new_slot_usage_true_new = len(np.unique(true_new_slot_preds))
 
     all_new_slots = np.arange(args.num_labeled_classes, args.num_labeled_classes + args.num_unlabeled_classes)
     if len(new_slot_preds) > 0 and len(all_new_slots) > 0:
         counts = np.array([(new_slot_preds == slot).sum() for slot in all_new_slots], dtype=np.float64)
         probs = counts[counts > 0] / counts.sum()
-        effective_new_slots = float(np.exp(-(probs * np.log(probs)).sum()))
+        effective_new_slots_all_predicted_new = float(np.exp(-(probs * np.log(probs)).sum()))
     else:
-        effective_new_slots = 0.0
+        effective_new_slots_all_predicted_new = 0.0
+
+    if len(true_new_slot_preds) > 0 and len(all_new_slots) > 0:
+        counts = np.array([(true_new_slot_preds == slot).sum() for slot in all_new_slots], dtype=np.float64)
+        probs = counts[counts > 0] / counts.sum()
+        effective_new_slots_true_new = float(np.exp(-(probs * np.log(probs)).sum()))
+    else:
+        effective_new_slots_true_new = 0.0
 
     args.logger.info(
         f'Slot Diagnostics ({save_name}): Epoch {epoch} | '
         f'novel_to_old_rate {novel_to_old_rate:.4f} | '
         f'old_to_new_rate {old_to_new_rate:.4f} | '
-        f'new_slot_usage {new_slot_usage}/{args.num_unlabeled_classes} | '
-        f'effective_new_slots {effective_new_slots:.2f}'
+        f'new_slot_usage_all_predicted_new {new_slot_usage_all_predicted_new}/{args.num_unlabeled_classes} | '
+        f'new_slot_usage_true_new {new_slot_usage_true_new}/{args.num_unlabeled_classes} | '
+        f'effective_new_slots_all_predicted_new {effective_new_slots_all_predicted_new:.2f} | '
+        f'effective_new_slots_true_new {effective_new_slots_true_new:.2f}'
     )
 
     for true_class in sorted(np.unique(targets[true_new_mask])):
