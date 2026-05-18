@@ -135,7 +135,8 @@ class PromptGuidedDINO(nn.Module):
     """
     def __init__(self, num_classes, extract_layers=(7, 11), num_coarse_classes=None,
                  num_prompt_tokens=4, disable_bridge=False, fine_prompt_only=False,
-                 no_prompts=False, grad_from_block=11, use_local_pooling=True):
+                 no_prompts=False, grad_from_block=11, use_local_pooling=True,
+                 bridge_scale=1.0):
         super().__init__()
         from network import build_multilayer_dino
 
@@ -159,6 +160,7 @@ class PromptGuidedDINO(nn.Module):
         self.fine_prompt_only = fine_prompt_only
         self.no_prompts = no_prompts
         self.use_local_pooling = use_local_pooling and not no_prompts
+        self.bridge_scale = bridge_scale
             
         # Multi-token learnable prompts for stronger representational capacity
         if no_prompts:
@@ -260,7 +262,7 @@ class PromptGuidedDINO(nn.Module):
 
                 # Avoid inplace operation which breaks PyTorch autograd
                 if prior_msg is not None:
-                    x_p_fine_new = x[:, fine_start:fine_end, :] + prior_msg.unsqueeze(1)
+                    x_p_fine_new = x[:, fine_start:fine_end, :] + self.bridge_scale * prior_msg.unsqueeze(1)
                     x = torch.cat([x[:, :fine_start, :], x_p_fine_new, x[:, fine_end:, :]], dim=1)
             
         # Final layer normalization

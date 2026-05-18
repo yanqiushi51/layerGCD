@@ -103,6 +103,69 @@ def coarse_fine_consistency_loss(fine_logits, coarse_logits, fine_to_coarse, tem
     return 0.5 * (kl_coarse_to_fine + kl_fine_to_coarse).mean()
 
 
+def log_coarse_hierarchy_diagnostics(hierarchy_tree, args, prefix='Initial'):
+    if hierarchy_tree is None or hierarchy_tree.sample_labels is None:
+        return
+
+    coarsest_layer = min(hierarchy_tree.extract_layers)
+    coarse_labels = hierarchy_tree.pseudo_labels[coarsest_layer].cpu().numpy().astype(int)
+    true_labels = hierarchy_tree.sample_labels.cpu().numpy().astype(int)
+    old_mask = hierarchy_tree.sample_old_mask.cpu().numpy().astype(bool)
+    new_mask = ~old_mask
+
+    purities = []
+    new_purities = []
+    class_counts = []
+    new_class_counts = []
+
+    for cluster_id in range(hierarchy_tree.n_clusters_per_level[coarsest_layer]):
+        cluster_mask = coarse_labels == cluster_id
+        if not cluster_mask.any():
+            continue
+
+        cluster_true = true_labels[cluster_mask]
+        _, counts = np.unique(cluster_true, return_counts=True)
+        purities.append(float(counts.max() / counts.sum()))
+        class_counts.append(int(len(counts)))
+
+        cluster_new = true_labels[cluster_mask & new_mask]
+        if len(cluster_new) > 0:
+            _, new_counts = np.unique(cluster_new, return_counts=True)
+            new_purities.append(float(new_counts.max() / new_counts.sum()))
+            new_class_counts.append(int(len(new_counts)))
+
+    new_class_cluster_counts = []
+    for true_class in sorted(np.unique(true_labels[new_mask])):
+        class_coarse = np.unique(coarse_labels[true_labels == true_class])
+        new_class_cluster_counts.append(int(len(class_coarse)))
+
+    avg_purity = float(np.mean(purities)) if purities else 0.0
+    avg_new_purity = float(np.mean(new_purities)) if new_purities else 0.0
+    avg_class_count = float(np.mean(class_counts)) if class_counts else 0.0
+    avg_new_class_count = float(np.mean(new_class_counts)) if new_class_counts else 0.0
+    avg_new_class_clusters = float(np.mean(new_class_cluster_counts)) if new_class_cluster_counts else 0.0
+
+    args.logger.info(
+        f'{prefix} Coarse Diagnostics: layer {coarsest_layer} | '
+        f'coarse_purity {avg_purity:.4f} | '
+        f'new_only_coarse_purity {avg_new_purity:.4f} | '
+        f'coarse_cluster_avg_class_count {avg_class_count:.2f} | '
+        f'coarse_cluster_avg_new_class_count {avg_new_class_count:.2f} | '
+        f'new_class_avg_coarse_clusters {avg_new_class_clusters:.2f}'
+    )
+
+    for cluster_id in range(hierarchy_tree.n_clusters_per_level[coarsest_layer]):
+        cluster_mask = coarse_labels == cluster_id
+        cluster_new = true_labels[cluster_mask & new_mask]
+        if len(cluster_new) == 0:
+            continue
+        classes, counts = np.unique(cluster_new, return_counts=True)
+        args.logger.info(
+            f'{prefix} Coarse Diagnostics: cluster {cluster_id} '
+            f'new_classes {_format_slot_counts(classes, counts, len(cluster_new), args.coarse_diagnostics_top_k)}'
+        )
+
+
 def train(model, train_loader, eval_loader_unlabelled, eval_loader_test, extract_loader,
           eval_loader_labelled, args):
     device = next(model.parameters()).device
@@ -139,6 +202,8 @@ def train(model, train_loader, eval_loader_unlabelled, eval_loader_test, extract
         )
         args.logger.info("Building initial hierarchy tree (coarse targets)...")
         hierarchy_tree.build_hierarchy(model.dino_feature_extractor, extract_loader, device=device)
+        if args.coarse_diagnostics:
+            log_coarse_hierarchy_diagnostics(hierarchy_tree, args)
     else:
         args.logger.info("Hierarchy disabled: skipping coarse pseudo-targets and relation relaxation.")
 
@@ -599,6 +664,57 @@ def test_ss_kmeans(model, labelled_loader, target_loader, epoch, save_name, args
     )
 
 
+def _format_slot_counts(slot_ids, counts, total, top_k=5):
+    order = np.argsort(counts)[::-1][:top_k]
+    parts = []
+    for idx in order:
+        slot = int(slot_ids[idx])
+        count = int(counts[idx])
+        parts.append(f'{slot}:{count}({count / total:.3f})')
+    return ', '.join(parts)
+
+
+def log_slot_diagnostics(targets, preds, mask, epoch, save_name, args):
+    mask = mask.astype(bool)
+    targets = targets.astype(int)
+    preds = preds.astype(int)
+
+    old_slot_mask = preds < args.num_labeled_classes
+    new_slot_mask = ~old_slot_mask
+    true_new_mask = ~mask
+
+    novel_to_old_rate = old_slot_mask[true_new_mask].mean() if true_new_mask.any() else 0.0
+    old_to_new_rate = new_slot_mask[mask].mean() if mask.any() else 0.0
+
+    new_slot_preds = preds[new_slot_mask]
+    new_slot_usage = len(np.unique(new_slot_preds))
+
+    all_new_slots = np.arange(args.num_labeled_classes, args.num_labeled_classes + args.num_unlabeled_classes)
+    if len(new_slot_preds) > 0 and len(all_new_slots) > 0:
+        counts = np.array([(new_slot_preds == slot).sum() for slot in all_new_slots], dtype=np.float64)
+        probs = counts[counts > 0] / counts.sum()
+        effective_new_slots = float(np.exp(-(probs * np.log(probs)).sum()))
+    else:
+        effective_new_slots = 0.0
+
+    args.logger.info(
+        f'Slot Diagnostics ({save_name}): Epoch {epoch} | '
+        f'novel_to_old_rate {novel_to_old_rate:.4f} | '
+        f'old_to_new_rate {old_to_new_rate:.4f} | '
+        f'new_slot_usage {new_slot_usage}/{args.num_unlabeled_classes} | '
+        f'effective_new_slots {effective_new_slots:.2f}'
+    )
+
+    for true_class in sorted(np.unique(targets[true_new_mask])):
+        class_mask = targets == true_class
+        class_preds = preds[class_mask]
+        slot_ids, counts = np.unique(class_preds, return_counts=True)
+        args.logger.info(
+            f'Slot Diagnostics ({save_name}): true_new_class {int(true_class)} '
+            f'top_slots {_format_slot_counts(slot_ids, counts, len(class_preds), args.slot_diagnostics_top_k)}'
+        )
+
+
 def test(model, test_loader, epoch, save_name, args):
     model.eval()
     device = next(model.parameters()).device
@@ -627,6 +743,19 @@ def test(model, test_loader, epoch, save_name, args):
     all_acc, old_acc, new_acc = log_accs_from_preds(y_true=targets, y_pred=preds, mask=mask,
                                                     T=epoch, eval_funcs=args.eval_funcs, save_name=save_name,
                                                     args=args)
+    if args.slot_diagnostics and (
+        args.slot_diagnostics_interval <= 0
+        or (epoch + 1) % args.slot_diagnostics_interval == 0
+        or epoch == args.epochs - 1
+    ):
+        log_slot_diagnostics(
+            targets=targets,
+            preds=preds,
+            mask=mask,
+            epoch=epoch,
+            save_name=save_name,
+            args=args,
+        )
 
     return all_acc, old_acc, new_acc
 
@@ -677,6 +806,8 @@ if __name__ == "__main__":
                         help='Use only the deepest DINO layer to build pseudo-targets.')
     parser.add_argument('--disable_bridge', action='store_true', default=False,
                         help='Keep coarse/fine prompts but block coarse-to-fine prompt transfer.')
+    parser.add_argument('--bridge_scale', type=float, default=1.0,
+                        help='Scale applied to coarse-to-fine bridge messages before adding them to fine prompts.')
     parser.add_argument('--fine_prompt_only', action='store_true', default=False,
                         help='Remove the coarse prompt branch and train only the fine prompt.')
     parser.add_argument('--no_prompts', action='store_true', default=False,
@@ -720,11 +851,21 @@ if __name__ == "__main__":
     parser.add_argument('--fp16', action='store_true', default=False)
     parser.add_argument('--print_freq', default=10, type=int)
     parser.add_argument('--exp_name', default=None, type=str)
-    parser.add_argument('--eval_sskmeans_interval', type=int, default=1,
+    parser.add_argument('--eval_sskmeans_interval', type=int, default=0,
                         help='Evaluate feature + semi-supervised k-means assignment every N epochs.')
     parser.add_argument('--sskmeans_features', type=str, default='fine_feat',
                         choices=['fine_feat', 'fine_proj', 'both'],
                         help='Feature space used for SS-KMeans assignment evaluation.')
+    parser.add_argument('--slot_diagnostics', action='store_true', default=False,
+                        help='Log raw head slot diagnostics before Hungarian matching.')
+    parser.add_argument('--slot_diagnostics_interval', type=int, default=0,
+                        help='Log slot diagnostics every N epochs; 0 logs whenever test() is called.')
+    parser.add_argument('--slot_diagnostics_top_k', type=int, default=5,
+                        help='Number of top predicted slots to list for each true novel class.')
+    parser.add_argument('--coarse_diagnostics', action='store_true', default=False,
+                        help='Log hierarchy coarse-cluster composition and purity diagnostics.')
+    parser.add_argument('--coarse_diagnostics_top_k', type=int, default=8,
+                        help='Number of top true new classes to list for each coarse cluster.')
 
     args = parser.parse_args()
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
@@ -798,6 +939,7 @@ if __name__ == "__main__":
         no_prompts=args.no_prompts,
         grad_from_block=args.grad_from_block,
         use_local_pooling=not args.disable_local_pooling,
+        bridge_scale=args.bridge_scale,
     ).to(device)
 
     args.logger.info('Models built')

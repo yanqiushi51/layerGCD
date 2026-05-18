@@ -54,6 +54,8 @@ class HierarchicalClusterTree:
         self.cluster_radii = {}   # layer_idx → [n_clusters]
         self.index_to_position = {}
         self.fine_to_level = {}   # layer_idx → [n_fine_clusters], fine slot to level cluster
+        self.sample_labels = None
+        self.sample_old_mask = None
 
     @torch.no_grad()
     def build_hierarchy(self, model, dataloader, device='cuda'):
@@ -117,6 +119,8 @@ class HierarchicalClusterTree:
         self.index_to_position = {
             int(sample_idx): pos for pos, sample_idx in enumerate(all_indices.tolist())
         }
+        self.sample_labels = all_labels
+        self.sample_old_mask = all_masks
 
         # Step 2: Bottom-up hierarchy construction
         # Start from the deepest DINO layer (finest clustering)
